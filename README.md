@@ -43,13 +43,15 @@ which npm already implies, plus two things **npm does not install**:
 | [Claude Code](https://claude.com/claude-code) | the host the agent runs in | see link |
 | [Codex CLI](https://github.com/openai/codex), authenticated | does the actual work | `npm install -g @openai/codex`, then run `codex` once to sign in |
 
-`npm install` prints which of these are present or missing, and
-`codex-subagent check` re-runs that report at any time.
+Run `codex-subagent check` at any time to see which are present. The installer
+prints the same report, though npm hides script output by default, so use
+`npm install -g --foreground-scripts …` if you want to watch it.
 
 Developed and tested against `codex-cli 0.145.0` and Claude Code 2.1.220 on
-Linux. The code is platform-neutral and CI is configured for Linux, macOS, and
-Windows on Node 18, 20, and 22, but macOS and Windows are not yet confirmed by a
-real run.
+Linux. Windows and macOS are implemented and covered by the test suite,
+including the `.cmd` shim npm creates for `codex` on Windows, but neither has
+been exercised on real hardware yet. CI is configured for all three across Node
+18, 20, and 22 and has not run yet either, since the repository is not published.
 
 ## Install
 
@@ -72,11 +74,13 @@ codex-subagent status      # what is installed, and does it still work
 codex-subagent check       # verify prerequisites only
 codex-subagent uninstall   # remove the agent, keep run directories
 codex-subagent purge       # also remove run directories (asks first)
+codex-subagent stop <dir>  # terminate a run that is still going
 ```
 
 `purge` prints an itemised plan and asks before deleting anything, since run
 directories hold your prompts and Codex's answers. `--dry-run` previews it and
-`--yes` skips the prompt for scripts. Without a terminal to confirm at, it
+`--yes` skips the prompt for scripts. `--force` extends it to a `codex.md` this
+package did not create. Without a terminal to confirm at, it
 refuses rather than assuming yes. `uninstall` has no prompt: it removes one file
 this package created, and reinstalling costs nothing.
 
@@ -109,7 +113,8 @@ The installer marks the file it generates, so it will not clobber or delete a
 existing file first. Reinstalling is idempotent, and uninstalling twice is
 harmless.
 
-Honours `CLAUDE_CONFIG_DIR` and `XDG_CACHE_HOME` if you have set them.
+Honours `CLAUDE_CONFIG_DIR`, `XDG_CACHE_HOME`, and `CODEX_HOME` if you have set
+them.
 
 ## Usage
 
@@ -146,7 +151,7 @@ exists because of an observed failure.
 
 ### Using the launcher directly
 
-The launcher is a standalone Bash script and needs no Claude Code at all.
+The launcher is a dependency-free Node program and needs no Claude Code at all.
 
 ```bash
 codex-subagent run --workdir /repo --sandbox read-only --model gpt-5.6-sol \
@@ -158,7 +163,11 @@ Or split it, which is what the agent does:
 ```bash
 RD=$(codex-subagent start --workdir /repo --sandbox read-only --prompt-file ./task.txt)
 codex-subagent wait "$RD" --timeout-sec 540   # exit 75 means call again
+codex-subagent stop "$RD"                    # if you want to abandon it
 ```
+
+`run` is `start` plus a single `wait` at the default 540 s. For longer jobs use
+`start` and `wait` separately so you can re-enter the wait.
 
 The prompt can also come on stdin instead of `--prompt-file`.
 
@@ -225,7 +234,7 @@ More detail in `docs/`:
 - **No cleanup.** Run directories accumulate under `~/.cache/codex-subagent/`.
 - **Agent changes need a restart.** The registry loads at session start, so
   editing the installed agent mid-session has no effect. Testing tip:
-  `claude -p --allowedTools "Agent,Bash,Read" "Dispatch the codex subagent ..."`
+  `claude -p --allowedTools "Agent,Bash,Read,Write" "Dispatch the codex subagent ..."`
   gets a fresh registry per invocation without restarting your main session.
 - **Trust but verify.** Codex has been observed reporting tests passing on a run
   where the patch was never applied. The agent is instructed to relay such
@@ -253,8 +262,9 @@ affected. That is not built yet.
 
 Worth understanding before you install this.
 
-The agent runs with `permissionMode: auto` and only `Bash` and `Read`, and every
-Bash call it makes goes through the launcher. But the **sandbox is chosen by
+The agent runs with `permissionMode: auto` and only `Bash`, `Read`, and `Write`
+(`Write` is how it hands the prompt to the launcher). Every Bash call it makes
+goes through the launcher. But the **sandbox is chosen by
 interpreting prose**. A prompt that asks for full access gets
 `danger-full-access`, which runs Codex with no containment at all. The default is
 `workspace-write` with network enabled, so by default Codex can modify anything

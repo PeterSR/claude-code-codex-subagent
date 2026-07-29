@@ -47,11 +47,11 @@
   "scripts": {
     "test": "node --test",
     "lint": "node --check bin/codex-subagent",
-    "postinstall": "node scripts/postinstall.mjs || true"
+    "postinstall": "node scripts/postinstall.mjs",
+    "prepublishOnly": "npm test"
   },
   "externalDependencies": {
     "codex": "OpenAI Codex CLI, npm install -g @openai/codex",
-    "setsid": "util-linux, used to detach runs",
     "claude": "Claude Code"
   },
   "type": "module"

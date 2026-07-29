@@ -11,6 +11,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// Nothing here may fail an install. `|| true` in the npm script would not work
+// on Windows, where scripts run through cmd.exe and `true` is not a command.
+process.on("uncaughtException", (err) => {
+  console.log(`\nclaude-code-codex-subagent: skipped setup report (${err.message})`);
+  console.log("  Run when ready:  codex-subagent install\n");
+  process.exit(0);
+});
 const CLI = path.join(ROOT, "bin", "codex-subagent");
 const MARKER = "installed-by: claude-code-codex-subagent";
 
@@ -59,10 +67,16 @@ const manual = (why, extra) => {
 // Under sudo, HOME is usually root's rather than the invoking user's, so an
 // automatic install would write the agent into the wrong home directory.
 const sudo = typeof process.getuid === "function" && process.getuid() === 0 && process.env.SUDO_USER;
+// A plain `npm install` in a clone is a contributor building the project, not a
+// user installing the tool. Do not touch their real Claude Code config.
+const globalInstall = process.env.npm_config_global === "true";
 const foreign = fs.existsSync(target) && !fs.readFileSync(target, "utf8").includes(MARKER);
 
 console.log("");
-if (sudo) {
+if (!globalInstall) {
+  manual("this is a local install, not a global one",
+         "installing from a clone? that is expected; nothing was written to your Claude Code config");
+} else if (sudo) {
   manual("running under sudo, and the agent belongs in your own home directory");
 } else if (!fs.existsSync(claudeDir)) {
   manual(`no Claude Code config found at ${claudeDir}`);

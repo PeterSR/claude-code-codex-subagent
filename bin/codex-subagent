@@ -30,6 +30,7 @@ Run:
   start [options]                    launch detached, print run dir, exit
   wait <run-dir> [--timeout-sec N]   block until finished or N seconds pass
   run [options]                      start then wait
+  stop <run-dir>                     terminate a running Codex process
 
 Manage:
   install [--force]   write the agent into Claude Code
@@ -88,6 +89,17 @@ function onPath(cmd) {
     }
   }
   return null;
+}
+
+// npm installs CLIs on Windows as .cmd/.bat shims, which cannot be executed by
+// spawn() directly. Route those through the command interpreter. Everything
+// else is spawned as-is, with no shell, so arguments stay unmangled.
+function spawnCodex(codexPath, args, options) {
+  if (process.platform === "win32" && /\.(cmd|bat)$/i.test(codexPath)) {
+    const comspec = process.env.ComSpec || "cmd.exe";
+    return spawn(comspec, ["/d", "/s", "/c", codexPath, ...args], options);
+  }
+  return spawn(codexPath, args, options);
 }
 
 const read = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
@@ -164,9 +176,6 @@ async function startRun(argv) {
     schema: o["--schema"] || "",
   };
 
-  if (!onPath("codex")) {
-    die("the 'codex' CLI is not on PATH. Install it with: npm install -g @openai/codex");
-  }
   if (!["read-only", "workspace-write", "danger-full-access"].includes(cfg.sandbox)) {
     die(`invalid --sandbox: ${cfg.sandbox}`);
   }
@@ -194,8 +203,15 @@ async function startRun(argv) {
   if (!prompt.trim()) die("empty prompt");
   fs.writeFileSync(promptFile, prompt);
 
+  // Probed last, so an argument mistake reports the argument rather than the
+  // environment.
+  const codexPath = onPath("codex");
+  if (!codexPath) {
+    die("the 'codex' CLI is not on PATH. Install it with: npm install -g @openai/codex");
+  }
+
   const args = buildCodexArgs(cfg, runDir);
-  fs.writeFileSync(path.join(runDir, "command.json"), JSON.stringify({ cmd: "codex", args }, null, 2));
+  fs.writeFileSync(path.join(runDir, "command.json"), JSON.stringify({ cmd: codexPath, args }, null, 2));
   fs.writeFileSync(path.join(runDir, "meta.json"), JSON.stringify({
     mode: cfg.resume ? "resume" : "fresh",
     sandbox: cfg.sandbox,
@@ -239,12 +255,13 @@ function cmdSupervise(argv) {
 
   fs.writeFileSync(path.join(runDir, "pid"), String(process.pid));
 
-  const { args } = JSON.parse(fs.readFileSync(path.join(runDir, "command.json"), "utf8"));
+  const { cmd, args } = JSON.parse(fs.readFileSync(path.join(runDir, "command.json"), "utf8"));
   const stdin = fs.openSync(path.join(runDir, "prompt.txt"), "r");
   const stdout = fs.openSync(path.join(runDir, "events.jsonl"), "w");
   const stderr = fs.openSync(path.join(runDir, "stderr.txt"), "w");
 
-  const child = spawn("codex", args, { stdio: [stdin, stdout, stderr], windowsHide: true });
+  const child = spawnCodex(cmd || "codex", args, { stdio: [stdin, stdout, stderr], windowsHide: true });
+  if (child.pid) fs.writeFileSync(path.join(runDir, "codex-pid"), String(child.pid));
 
   const finish = (code) => {
     const tmp = path.join(runDir, "exit.tmp");
@@ -414,15 +431,16 @@ function cmdInstall(argv) {
 
   let stat = null;
   try { stat = fs.lstatSync(target); } catch { /* absent */ }
-  if (stat && !stat.isSymbolicLink() && !ownsTarget()) {
+  if (stat && !ownsTarget()) {
     if (!force) {
       die(`${target} exists and was not created by this installer.\n     Re-run with --force to back it up and replace it.`);
     }
     const backup = `${target}.bak.${new Date().toISOString().replace(/[-:T.]/g, "").slice(0, 14)}`;
-    fs.copyFileSync(target, backup);
+    fs.copyFileSync(target, backup);   // follows a symlink, copying the content
     warn(`backed up existing agent to ${backup}`);
   }
-  if (stat && stat.isSymbolicLink()) fs.unlinkSync(target); // early versions symlinked
+  // Replace rather than write through a symlink, so we never edit its target.
+  if (stat && stat.isSymbolicLink()) fs.unlinkSync(target);
 
   let body = template.split(PLUGIN_ROOT_TOKEN).join(ROOT);
   if (body.includes("CLAUDE_PLUGIN_ROOT")) die("unsubstituted plugin-root reference remains in rendered agent");
@@ -444,7 +462,7 @@ function cmdUninstall(argv) {
   let stat = null;
   try { stat = fs.lstatSync(target); } catch { /* absent */ }
   if (!stat) { out("Agent not installed, nothing to remove."); return EX_OK; }
-  if (!stat.isSymbolicLink() && !ownsTarget() && !force) {
+  if (!ownsTarget() && !force) {
     die(`${target} was not created by this installer. Re-run with --force to remove it anyway.`);
   }
   fs.rmSync(target, { force: true });
@@ -504,6 +522,27 @@ async function cmdPurge(argv) {
   return EX_OK;
 }
 
+function cmdStop(argv) {
+  const runDir = argv[0];
+  if (!runDir || runDir.startsWith("-")) die("stop: needs a run directory");
+  if (!exists(runDir)) die(`stop: run dir not found: ${runDir}`);
+  if (exists(path.join(runDir, "exit"))) { out("Run already finished."); return EX_OK; }
+
+  const codexPid = read(path.join(runDir, "codex-pid"));
+  const supervisorPid = read(path.join(runDir, "pid"));
+  let stopped = false;
+  // Codex first: killing only the supervisor would orphan it, leaving it
+  // running with whatever sandbox it was granted.
+  for (const [label, pid] of [["codex", codexPid], ["supervisor", supervisorPid]]) {
+    if (!pid) continue;
+    try { process.kill(Number(pid), "SIGTERM"); out(`Sent SIGTERM to ${label} (${pid})`); stopped = true; }
+    catch { out(`${label} (${pid}) was not running`); }
+  }
+  if (!stopped) { out("Nothing to stop; no live process recorded for this run."); return EX_DIED; }
+  out("The supervisor writes a completion marker as it exits; `wait` will report it.");
+  return EX_OK;
+}
+
 // ------------------------------------------------------------------- main ---
 const [sub, ...rest] = process.argv.slice(2);
 
@@ -520,6 +559,7 @@ switch (sub) {
   case "install":   process.exit(cmdInstall(rest)); break;
   case "uninstall": process.exit(cmdUninstall(rest)); break;
   case "purge":     process.exit(await cmdPurge(rest)); break;
+  case "stop":      process.exit(cmdStop(rest)); break;
   case "status":    process.exit(cmdStatus()); break;
   case "check":     process.exit(cmdCheck()); break;
   default: die(`unknown subcommand: ${sub}`);

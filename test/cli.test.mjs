@@ -55,14 +55,18 @@ test("argument validation", async (t) => {
   await t.test("a missing value exits 64", () => {
     assert.equal(cli(["start", "--model"], { stdin: "x" }).code, 64);
   });
-  await t.test("an invalid sandbox is rejected", () => {
-    assert.equal(cli(["start", "--sandbox", "nonsense"], { stdin: "x" }).code, 64);
+  await t.test("an invalid sandbox is rejected for the right reason", () => {
+    const r = cli(["start", "--sandbox", "nonsense"], { stdin: "x" });
+    assert.equal(r.code, 64);
+    assert.match(r.out, /invalid --sandbox/, "argument errors must not be masked by environment checks");
   });
   await t.test("an unknown subcommand is rejected", () => {
     assert.equal(cli(["bogus"]).code, 64);
   });
-  await t.test("a missing prompt file is rejected", () => {
-    assert.equal(cli(["start", "--prompt-file", path.join(TMP, "nope.txt")]).code, 64);
+  await t.test("a missing prompt file is rejected for the right reason", () => {
+    const r = cli(["start", "--prompt-file", path.join(TMP, "nope.txt")]);
+    assert.equal(r.code, 64);
+    assert.match(r.out, /--prompt-file not found/);
   });
 });
 
@@ -121,9 +125,11 @@ test("run state machine", async (t) => {
     assert.match(cli(["wait", dir, "--timeout-sec", "1"]).out, /thread_id: spaced-9/);
   });
 
-  await t.test("reusing a run directory is refused", () => {
+  await t.test("reusing a run directory is refused for the right reason", () => {
     const dir = mkRun("reuse", { exit: "0" });
-    assert.equal(cli(["start", "--run-dir", dir], { stdin: "x" }).code, 64);
+    const r = cli(["start", "--run-dir", dir], { stdin: "x" });
+    assert.equal(r.code, 64);
+    assert.match(r.out, /run dir already used/);
   });
 });
 
@@ -193,6 +199,91 @@ test("install lifecycle", async (t) => {
     assert.equal(cli(["purge", "--yes"]).code, 0);
     assert.ok(!fs.existsSync(runs), "run directory survived purge");
     assert.ok(!fs.existsSync(agentPath()), "agent survived purge");
+  });
+});
+
+// A stub `codex` on PATH lets the whole start/supervise/wait path run for real
+// without a network call or an API key. On Windows this is what catches a
+// launcher that cannot execute the .cmd shim npm installs.
+function stubCodex(behaviour) {
+  const dir = fs.mkdtempSync(path.join(TMP, "stub-"));
+  const js = path.join(dir, "stub.mjs");
+  fs.writeFileSync(js, behaviour);
+  if (process.platform === "win32") {
+    fs.writeFileSync(path.join(dir, "codex.cmd"), `@echo off\r\nnode "${js}" %*\r\n`);
+  } else {
+    fs.writeFileSync(path.join(dir, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${js}" "$@"\n`, { mode: 0o755 });
+  }
+  return dir;
+}
+
+// Emits one thread.started event, writes the answer to the -o path, exits 0.
+const STUB_OK = `
+import fs from "node:fs";
+const args = process.argv.slice(2);
+const outIdx = args.findIndex((a) => a === "-o");
+process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "stub-thread-1" }) + "\\n");
+if (outIdx !== -1) fs.writeFileSync(args[outIdx + 1], "STUB ANSWER");
+process.exit(0);
+`;
+
+test("end to end with a stub codex", async (t) => {
+  await t.test("start, supervise, and wait complete a real run", async () => {
+    const bin = stubCodex(STUB_OK);
+    const env = { PATH: bin + path.delimiter + process.env.PATH };
+    const started = cli(["start", "--workdir", TMP, "--sandbox", "read-only"], { stdin: "do a thing", env });
+    assert.equal(started.code, 0, started.out);
+    const runDir = started.out.trim().split("\n").pop();
+
+    const waited = cli(["wait", runDir, "--timeout-sec", "20"], { env });
+    assert.equal(waited.code, 0, waited.out);
+    assert.match(waited.out, /STUB ANSWER/);
+    assert.match(waited.out, /thread_id: stub-thread-1/);
+    assert.match(waited.out, /finished \(exit 0\)/);
+  });
+
+  await t.test("the prompt and resolved command are recorded", () => {
+    const bin = stubCodex(STUB_OK);
+    const env = { PATH: bin + path.delimiter + process.env.PATH };
+    const started = cli(["start", "--workdir", TMP, "--sandbox", "read-only",
+                         "--model", "some-model", "--effort", "low", "--no-network"],
+                        { stdin: "remember this prompt", env });
+    const runDir = started.out.trim().split("\n").pop();
+    cli(["wait", runDir, "--timeout-sec", "20"], { env });
+
+    assert.equal(fs.readFileSync(path.join(runDir, "prompt.txt"), "utf8"), "remember this prompt");
+    const { cmd, args } = JSON.parse(fs.readFileSync(path.join(runDir, "command.json"), "utf8"));
+    assert.ok(cmd.includes("codex"), `resolved command looks wrong: ${cmd}`);
+    assert.deepEqual(args.slice(0, 4), ["exec", "-s", "read-only", "-C"]);
+    assert.ok(args.includes("some-model"), "model not passed through");
+    assert.ok(args.includes("model_reasoning_effort=low"), "effort not passed through");
+    assert.ok(!args.some((a) => a.includes("network_access")), "network flag set for read-only");
+  });
+
+  await t.test("resume passes the sandbox via -c and omits -C", () => {
+    const bin = stubCodex(STUB_OK);
+    const env = { PATH: bin + path.delimiter + process.env.PATH };
+    const started = cli(["start", "--resume", "thread-xyz", "--sandbox", "workspace-write"],
+                        { stdin: "continue", env });
+    const runDir = started.out.trim().split("\n").pop();
+    const { args } = JSON.parse(fs.readFileSync(path.join(runDir, "command.json"), "utf8"));
+    assert.deepEqual(args.slice(0, 5), ["exec", "resume", "thread-xyz", "-c", "sandbox_mode=workspace-write"]);
+    assert.ok(!args.includes("-C"), "resume must not pass a working directory");
+    assert.ok(args.includes("sandbox_workspace_write.network_access=true"), "network default lost");
+  });
+
+  await t.test("a nonzero codex exit is surfaced with its stderr", () => {
+    const bin = stubCodex(`
+      import fs from "node:fs";
+      process.stderr.write("stub exploded\\n");
+      process.exit(7);
+    `);
+    const env = { PATH: bin + path.delimiter + process.env.PATH };
+    const started = cli(["start", "--workdir", TMP, "--sandbox", "read-only"], { stdin: "x", env });
+    const runDir = started.out.trim().split("\n").pop();
+    const waited = cli(["wait", runDir, "--timeout-sec", "20"], { env });
+    assert.equal(waited.code, 7);
+    assert.match(waited.out, /stub exploded/);
   });
 });
 
