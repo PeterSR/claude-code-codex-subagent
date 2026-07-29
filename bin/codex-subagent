@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# codex-subagent: run Codex on behalf of the Claude Code `codex` subagent.
+#
+# Subcommands:
+#   start [options]                    launch detached, print run dir, exit
+#   wait <run-dir> [--timeout-sec N]   block until finished or N seconds pass
+#   run [options]                      start then wait
+#
+# The prompt is read from stdin (or --prompt-file) by `start` and `run`.
+#
+# Codex is launched with setsid so it survives the caller's process group being
+# torn down. A subagent's background Bash child IS killed when its turn ends, so
+# the agent must `start` (detached), then `wait` in foreground chunks that each
+# stay under the Bash tool's 600000 ms cap.
+#
+# Options for start/run:
+#   --sandbox <read-only|workspace-write|danger-full-access>   default: workspace-write
+#   --no-network            disable network (default: enabled for workspace-write)
+#   --model <name>          default: unset, inherits ~/.codex/config.toml
+#   --effort <none|minimal|low|medium|high|xhigh>
+#   --workdir <dir>         working root; default: $PWD. Ignored when resuming.
+#   --resume <thread-id>    continue an existing Codex thread
+#   --schema <file>         JSON Schema for structured final output
+#   --prompt-file <file>    read prompt from a file instead of stdin
+#   --run-dir <dir>         override run directory location (must not be reused)
+#
+# Exit codes: 0 success, 64 usage error, 70 run died, 75 not finished yet,
+# otherwise Codex's own exit code.
+
+set -uo pipefail
+
+die() { printf 'codex-subagent: %s\n' "$1" >&2; exit 64; }
+
+# Validate that an option has a real value. Guards three separate bugs: a
+# trailing flag with no value would make `shift 2` fail and, without `set -e`,
+# spin the parse loop forever; an empty value would silently take a default; and
+# a following option would be swallowed as the value (`--resume --last` used to
+# resume the newest thread instead of erroring).
+need_val() {
+  local flag="$1" remaining="$2" value="${3-}"
+  [ "$remaining" -ge 2 ] || die "$flag requires a value"
+  [ -n "$value" ] || die "$flag requires a non-empty value"
+  case "$value" in
+    -*) die "$flag requires a value but got another option: $value" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- report ----
+emit_report() {
+  local RUN_DIR="$1"
+  local EXIT ANSWER THREAD BYTES
+  ANSWER="$RUN_DIR/answer.md"
+  EXIT="$(cat "$RUN_DIR/exit" 2>/dev/null || echo "")"
+  THREAD="$(grep -o '"thread_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$RUN_DIR/events.jsonl" 2>/dev/null \
+            | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+  [ -n "$THREAD" ] || THREAD="$(cat "$RUN_DIR/resume-id" 2>/dev/null || echo "")"
+  BYTES=0
+  [ -f "$ANSWER" ] && BYTES=$(wc -c < "$ANSWER" | tr -d ' ')
+
+  echo "=== codex-subagent ==="
+  echo "status:    $([ -n "$EXIT" ] && echo "finished (exit $EXIT)" || echo "STILL RUNNING")"
+  echo "thread_id: ${THREAD:-unknown}"
+  echo "run_dir:   $RUN_DIR"
+  [ -f "$RUN_DIR/meta.txt" ] && cat "$RUN_DIR/meta.txt"
+  echo "answer:    $ANSWER ($BYTES bytes)"
+
+  if [ -n "$EXIT" ] && [ "$EXIT" != "0" ]; then
+    echo
+    echo "--- stderr (tail) ---"
+    tail -20 "$RUN_DIR/stderr.txt" 2>/dev/null
+    echo "--- last events ---"
+    tail -3 "$RUN_DIR/events.jsonl" 2>/dev/null | cut -c1-300
+  fi
+
+  if [ "$BYTES" -gt 0 ]; then
+    echo
+    if [ "$BYTES" -le 30000 ]; then
+      echo "--- answer ---"
+      cat "$ANSWER"
+    else
+      echo "--- answer (truncated, $BYTES bytes; Read the full file at the path above) ---"
+      head -c 8000 "$ANSWER"
+      printf '\n[...truncated...]\n'
+    fi
+  fi
+}
+
+# Is the detached run still alive? Distinguishes "still working" from "died
+# without ever writing a completion marker", which otherwise loops forever.
+run_alive() {
+  local RUN_DIR="$1" PID
+  PID="$(cat "$RUN_DIR/pid" 2>/dev/null || echo "")"
+  [ -n "$PID" ] || return 1
+  kill -0 "$PID" 2>/dev/null
+}
+
+# ------------------------------------------------------------------ wait ----
+do_wait() {
+  local RUN_DIR="${1:-}"
+  shift || true
+  local TIMEOUT=540
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout-sec) need_val "$1" $# "${2-}"; TIMEOUT="$2"; shift 2 ;;
+      *) die "wait: unknown option: $1" ;;
+    esac
+  done
+  [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || die "wait: run dir not found: ${RUN_DIR:-<missing>}"
+  case "$TIMEOUT" in
+    ''|*[!0-9]*) die "--timeout-sec must be a non-negative integer, got: $TIMEOUT" ;;
+  esac
+
+  local WAITED=0 STEP
+  while [ ! -f "$RUN_DIR/exit" ] && [ "$WAITED" -lt "$TIMEOUT" ]; do
+    # Never overshoot the caller's budget; it may be sized against a hard cap.
+    STEP=$((TIMEOUT - WAITED))
+    [ "$STEP" -gt 5 ] && STEP=5
+    sleep "$STEP"
+    WAITED=$((WAITED + STEP))
+    # Detect a run that died without writing a marker.
+    if [ ! -f "$RUN_DIR/exit" ] && ! run_alive "$RUN_DIR"; then
+      sleep 1   # let a just-finished writer land its marker
+      if [ ! -f "$RUN_DIR/exit" ]; then
+        emit_report "$RUN_DIR"
+        echo
+        echo "RUN DIED without writing a completion marker. Check $RUN_DIR/stderr.txt"
+        return 70
+      fi
+    fi
+  done
+
+  emit_report "$RUN_DIR"
+
+  if [ ! -f "$RUN_DIR/exit" ]; then
+    echo
+    echo "NOT FINISHED after ${WAITED}s. Codex is still running (detached)."
+    printf 'Call again: %s wait %q\n' "$0" "$RUN_DIR"
+    return 75
+  fi
+
+  local CODE
+  CODE="$(cat "$RUN_DIR/exit" 2>/dev/null || echo "")"
+  case "$CODE" in
+    ''|*[!0-9]*) return 70 ;;
+  esac
+  return "$CODE"
+}
+
+# ----------------------------------------------------------------- start ----
+do_start() {
+  local SANDBOX="workspace-write" NETWORK="true" MODEL="" EFFORT=""
+  local WORKDIR="$PWD" RESUME="" SCHEMA="" PROMPT_FILE="" RUN_DIR=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sandbox)     need_val "$1" $# "${2-}"; SANDBOX="$2"; shift 2 ;;
+      --model)       need_val "$1" $# "${2-}"; MODEL="$2"; shift 2 ;;
+      --effort)      need_val "$1" $# "${2-}"; EFFORT="$2"; shift 2 ;;
+      --workdir)     need_val "$1" $# "${2-}"; WORKDIR="$2"; shift 2 ;;
+      --resume)      need_val "$1" $# "${2-}"; RESUME="$2"; shift 2 ;;
+      --schema)      need_val "$1" $# "${2-}"; SCHEMA="$2"; shift 2 ;;
+      --prompt-file) need_val "$1" $# "${2-}"; PROMPT_FILE="$2"; shift 2 ;;
+      --run-dir)     need_val "$1" $# "${2-}"; RUN_DIR="$2"; shift 2 ;;
+      --no-network)  NETWORK="false"; shift ;;
+      *)             die "unknown option: $1" ;;
+    esac
+  done
+
+  command -v codex > /dev/null 2>&1 \
+    || die "the 'codex' CLI is not on PATH. Install it with: npm install -g @openai/codex"
+
+  case "$SANDBOX" in
+    read-only|workspace-write|danger-full-access) ;;
+    *) die "invalid --sandbox: $SANDBOX" ;;
+  esac
+  [ -n "$RESUME" ] || [ -d "$WORKDIR" ] || die "--workdir does not exist: $WORKDIR"
+  [ -z "$SCHEMA" ] || [ -f "$SCHEMA" ] || die "--schema file not found: $SCHEMA"
+
+  [ -n "$RUN_DIR" ] || RUN_DIR="$HOME/.cache/codex-subagent/$(date +%Y%m%d-%H%M%S)-$$"
+  # Refuse to reuse a directory that already holds a run. Reuse used to leave a
+  # stale `exit` marker in place, so `wait` returned the PREVIOUS run's answer
+  # immediately while the new run was still going.
+  if [ -e "$RUN_DIR/exit" ] || [ -e "$RUN_DIR/events.jsonl" ] || [ -e "$RUN_DIR/pid" ]; then
+    die "run dir already used, pick another: $RUN_DIR"
+  fi
+  mkdir -p "$RUN_DIR" || die "cannot create run dir: $RUN_DIR"
+
+  local PROMPT="$RUN_DIR/prompt.txt"
+  if [ -n "$PROMPT_FILE" ]; then
+    [ -f "$PROMPT_FILE" ] || die "--prompt-file not found: $PROMPT_FILE"
+    cp "$PROMPT_FILE" "$PROMPT"
+  else
+    cat > "$PROMPT"
+  fi
+  [ -s "$PROMPT" ] || die "empty prompt"
+
+  # `resume` accepts neither -s/--sandbox nor -C/--cd. Sandbox goes through -c,
+  # and the working root stays pinned to wherever the thread was born.
+  local cmd=(codex exec)
+  if [ -n "$RESUME" ]; then
+    cmd+=(resume "$RESUME" -c "sandbox_mode=$SANDBOX")
+    printf '%s' "$RESUME" > "$RUN_DIR/resume-id"
+  else
+    cmd+=(-s "$SANDBOX" -C "$WORKDIR")
+  fi
+  [ "$SANDBOX" = "workspace-write" ] && cmd+=(-c "sandbox_workspace_write.network_access=$NETWORK")
+  [ -n "$MODEL" ]  && cmd+=(-m "$MODEL")
+  [ -n "$EFFORT" ] && cmd+=(-c "model_reasoning_effort=$EFFORT")
+  [ -n "$SCHEMA" ] && cmd+=(--output-schema "$SCHEMA")
+  cmd+=(--json --skip-git-repo-check -o "$RUN_DIR/answer.md" -)
+
+  printf '%s\n' "${cmd[*]}" > "$RUN_DIR/command.txt"
+  {
+    echo "mode:      $([ -n "$RESUME" ] && echo resume || echo fresh)"
+    echo "sandbox:   $SANDBOX (network=$([ "$SANDBOX" = workspace-write ] && echo "$NETWORK" || echo n/a))"
+    echo "model:     ${MODEL:-<config default>}"
+    echo "workdir:   $([ -n "$RESUME" ] && echo '<pinned to original thread>' || echo "$WORKDIR")"
+  } > "$RUN_DIR/meta.txt"
+
+  # setsid detaches into a new session so the run survives the caller's process
+  # group being torn down when a subagent turn ends. The inner shell publishes
+  # its pid immediately (so a dead run is detectable) and writes the completion
+  # marker via an atomic rename (so a concurrent reader never sees it empty).
+  setsid nohup bash -c '
+    RUN_DIR="$1"; shift
+    echo $$ > "$RUN_DIR/pid"
+    "$@" < "$RUN_DIR/prompt.txt" > "$RUN_DIR/events.jsonl" 2> "$RUN_DIR/stderr.txt"
+    printf "%s" $? > "$RUN_DIR/exit.tmp"
+    mv -f "$RUN_DIR/exit.tmp" "$RUN_DIR/exit"
+  ' _ "$RUN_DIR" "${cmd[@]}" > /dev/null 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+
+  # Health-check the launch. Without this, a failure in setsid/nohup/bash left a
+  # run dir that never gets a completion marker, so every later wait reported
+  # "still running" forever.
+  local TRIES=0
+  while [ ! -f "$RUN_DIR/pid" ] && [ ! -f "$RUN_DIR/exit" ] && [ "$TRIES" -lt 50 ]; do
+    sleep 0.1
+    TRIES=$((TRIES + 1))
+  done
+  if [ ! -f "$RUN_DIR/pid" ] && [ ! -f "$RUN_DIR/exit" ]; then
+    die "detached launch failed, no pid appeared in $RUN_DIR (is setsid available?)"
+  fi
+
+  echo "$RUN_DIR"
+}
+
+# ------------------------------------------------------------------ main ----
+[ $# -gt 0 ] || die "no subcommand; try --help"
+
+case "$1" in
+  -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+  start)     shift; do_start "$@" ;;
+  wait)      shift; do_wait "$@" ;;
+  run)
+    shift
+    RD="$(do_start "$@")" || exit $?
+    do_wait "$RD"
+    ;;
+  *) die "unknown subcommand: $1" ;;
+esac
