@@ -221,6 +221,10 @@ do_start() {
   # group being torn down when a subagent turn ends. The inner shell publishes
   # its pid immediately (so a dead run is detectable) and writes the completion
   # marker via an atomic rename (so a concurrent reader never sees it empty).
+  #
+  # The body is single-quoted deliberately: it is expanded by the inner shell,
+  # not by this one. Arguments arrive positionally after the `_` placeholder.
+  # shellcheck disable=SC2016
   setsid nohup bash -c '
     RUN_DIR="$1"; shift
     echo $$ > "$RUN_DIR/pid"
@@ -249,7 +253,7 @@ do_start() {
 [ $# -gt 0 ] || die "no subcommand; try --help"
 
 case "$1" in
-  -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
   start)     shift; do_start "$@" ;;
   wait)      shift; do_wait "$@" ;;
   run)

@@ -4,10 +4,10 @@ Date: 2026-07-28
 Plugin version inspected: `openai-codex/codex/1.0.6`
 Codex CLI version: `codex-cli 0.145.0`
 
-Companion to `codex-as-subagent-from-claude-code-2026-07-27.md` and
-`subagent-learnings/claude-coordinator-learnings.md`. Those two recorded
-*observed behaviour*. This one records *why*, read from the plugin source, plus
-the capability ceiling that behaviour runs into.
+Background for this project. Earlier observation logs, not included here,
+recorded *what* the official plugin does when driven from Claude Code. This one
+records *why*, read from the plugin source, plus the capability ceiling that
+behaviour runs into.
 
 Goal driving the investigation: make Codex feel like a first-class Claude Code
 subagent, with free choice of model and sandbox, not a fire-and-forget rescue
@@ -42,10 +42,10 @@ That is a coherent design. It is just built around a person driving the
 lifecycle. It is not built for an agent orchestrating several Codex jobs across
 a multi-phase refactor.
 
-So the earlier learnings' conclusion, "the coordinator owns the whole
-lifecycle", was not a workaround discovered in spite of the plugin. It is the
-plugin's own architecture, and the coordinator in question was meant to be
-Peter, not Claude.
+So the earlier conclusion, "the coordinator owns the whole lifecycle", was not a
+workaround discovered in spite of the plugin. It is the plugin's own
+architecture, and the coordinator in question was meant to be a human, not
+Claude.
 
 Corollary worth stating plainly: for the lifecycle there is nothing to
 "bypass". The plugin has closed that door to the model deliberately. Bash
@@ -53,7 +53,7 @@ against `codex-companion.mjs` is the only model-reachable path.
 
 ## Where the old --fresh vs --resume contradiction came from
 
-`claude-coordinator-learnings.md` section 9 recorded that `--fresh` blocked and
+Earlier observation logs recorded that `--fresh` blocked and
 returned the full answer inline, while `--resume` returned a job id to poll, and
 flagged it as one data point each way.
 
@@ -75,7 +75,7 @@ id at all, which breaks any orchestration that expects to parse one.
 ## Correction to the earlier handoff-delay claim
 
 The 41 to 87 second handoff recorded in
-`codex-as-subagent-from-claude-code-2026-07-27.md` is **not** purely the Sonnet
+earlier observation logs is **not** purely the Sonnet
 forwarder turn. It is the forwarder turn plus Codex app-server broker startup.
 `scripts/lib/codex.mjs` `ensureBrokerSession` spins up a shared app-server on
 the first call in a workspace and reuses it afterwards.
@@ -116,7 +116,7 @@ What it does **not** expose, all of which `codex exec` supports directly:
 | Resume by id | `codex exec resume <SESSION_ID>` | `--resume-last` is racy under parallelism |
 | Explicit working root | `-C, --cd <DIR>` | Decouples job state from shell cwd |
 | Extra writable dirs | `--add-dir <DIR>` | Multi-root work |
-| Run outside a repo | `--skip-git-repo-check` | This folder is not a git repo |
+| Run outside a repo | `--skip-git-repo-check` | Target need not be a git repo |
 | Local/OSS models | `--oss`, `--local-provider` | Not reachable via companion |
 | Images | `-i, --image` | Not reachable via companion |
 | Event stream | `--json` | JSONL events for progress |
@@ -125,7 +125,7 @@ The companion drives the **app-server broker**, not `codex exec`. That is where
 it gets streaming progress and thread reuse, and it is also why its surface is
 narrower: it exposes what the broker protocol was wired for.
 
-The network restriction recorded in the weaverbird notes ("no network, `go get`
+The network restriction observed in earlier Go-project testing ("no network, `go get`
 and `proxy.golang.org` and `github.com` all fail") is a consequence of
 `workspace-write` defaults. `-c sandbox_workspace_write.network_access=true`
 addresses it, and there is no way to ask the companion for that.
@@ -149,27 +149,20 @@ Two practical consequences:
   grepping `status` text output, which was the source of the "matches every
   historical job" trap in the earlier notes.
 
-## Environment facts
-
-`~/.codex/config.toml` currently:
-
-```toml
-model = "gpt-5.4"
-model_reasoning_effort = "medium"
-personality = "pragmatic"
-
-[notice.model_migrations]
-"gpt-5.4" = "gpt-5.6-terra"
-```
-
-The configured label is deprecated and silently redirected. Models seen in
-`~/.codex/models_cache.json`: `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`,
-`gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`. The plugin additionally maps
-`spark` to `gpt-5.3-codex-spark`.
+## Where defaults come from
 
 Because the plugin leaves model and effort unset by default, every unflagged
-call inherits whatever is in `config.toml`. That file is therefore the real
-default-setting lever for the official path.
+call inherits whatever `~/.codex/config.toml` holds. That file is therefore the
+real default-setting lever for the official path.
+
+Worth checking your own config for a `[notice.model_migrations]` table. A model
+label can be deprecated and silently redirected to a newer one, so the name in
+the config is not necessarily the model being served.
+
+Model names available at the time of writing (2026-07-28): `gpt-5.4`,
+`gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`. The
+plugin additionally maps `spark` to `gpt-5.3-codex-spark`. Check
+`~/.codex/models_cache.json` for the current list.
 
 ## What "native feeling" actually means
 

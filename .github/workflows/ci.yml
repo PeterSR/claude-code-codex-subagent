@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          bash -n bin/codex-subagent
+          bash -n install.sh
+
+      - name: ShellCheck
+        run: shellcheck bin/codex-subagent install.sh
+
+      - name: Agent template has no unsubstituted paths
+        run: |
+          grep -q '@@LAUNCHER@@' agents/codex.md
+          grep -q '@@SCHEMAS@@' agents/codex.md
+          ! grep -qE '/home/|/Users/' agents/codex.md bin/codex-subagent install.sh
+
+      - name: Schemas are valid JSON
+        run: |
+          for f in schemas/*.json; do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
+          done
+
+      - name: Install and uninstall round-trip
+        run: |
+          export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude"
+          ./install.sh || true          # codex CLI is absent in CI; install still writes the agent
+          test -f "$CLAUDE_CONFIG_DIR/agents/codex.md"
+          ! grep -q '@@' "$CLAUDE_CONFIG_DIR/agents/codex.md"
+          ./install.sh                  # idempotent
+          ./install.sh --status
+          ./install.sh --uninstall
+          test ! -f "$CLAUDE_CONFIG_DIR/agents/codex.md"

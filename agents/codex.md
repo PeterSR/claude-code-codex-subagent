@@ -44,7 +44,7 @@ anything else is Codex's own exit code.
 Step 2, prompt on stdin via a quoted heredoc so nothing gets mangled:
 
 ```bash
-@@LAUNCHER@@ start \
+"@@LAUNCHER@@" start \
   --workdir /abs/path/to/repo \
   --sandbox workspace-write <<'CODEX_PROMPT'
 ...composed prompt here...
@@ -54,7 +54,7 @@ CODEX_PROMPT
 Step 3, with the Bash tool `timeout` set to `570000`:
 
 ```bash
-@@LAUNCHER@@ wait <run-dir> --timeout-sec 540
+"@@LAUNCHER@@" wait <run-dir> --timeout-sec 540
 ```
 
 Do not report a placeholder such as "waiting for it to complete" as your final
@@ -93,7 +93,7 @@ tasks. It returns a summary, an array of findings carrying severity, confidence,
 file, line, detail, and failure scenario, plus open questions.
 
 ```bash
-@@LAUNCHER@@ start --workdir /repo --sandbox read-only \
+"@@LAUNCHER@@" start --workdir /repo --sandbox read-only \
   --schema "@@SCHEMAS@@/findings.schema.json" <<'CODEX_PROMPT'
 ...
 CODEX_PROMPT

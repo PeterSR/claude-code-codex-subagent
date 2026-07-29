@@ -1,8 +1,8 @@
 # How Claude Code Subagents Actually Work
 
 Date: 2026-07-28
-Claude Code version installed: 2.1.220 (some source claims traced against a
-decompiled 2.1.186 bundle, noted where relevant)
+Claude Code version: 2.1.220 (a few internal-behaviour claims were traced
+against 2.1.186 and are noted where relevant)
 
 Researched to answer one question: can Codex be made to feel like a first-class
 Claude Code subagent, rather than a fire-and-forget rescue button?
@@ -208,17 +208,14 @@ Notes:
 
 ## Plugin agents are strictly weaker than user agents
 
-Two different parser functions, with real code-enforced asymmetries. From the
-decompiled bundle:
+Plugin agents and user agents go through two different parser functions, with
+real asymmetries enforced in code rather than merely documented. The plugin-agent
+parser explicitly checks for `permissionMode`, `hooks`, and `mcpServers`, logs a
+warning naming the offending file and field, and drops them, directing the author
+to `.claude/agents/` for that level of control.
 
-```js
-for (let F of ["permissionMode", "hooks", "mcpServers"])
-  if (c[F] !== void 0)
-    T(`Plugin agent file ${e} sets ${F}, which is ignored for plugin agents.
-       Use .claude/agents/ for this level of control.`, {level: "warn"});
-```
-
-Plugin agents silently lose `permissionMode`, `hooks`, and `mcpServers`. They
+Plugin agents therefore silently lose `permissionMode`, `hooks`, and
+`mcpServers` in effect, even though the frontmatter parses. They
 also recognise only `isolation: worktree` and drop `remote` with no warning,
 whereas the user-agent parser at least validates it.
 
@@ -239,13 +236,14 @@ Registration and namespacing, for reference:
 
 ## The registry is flat and merged
 
-`MB()` unions built-in, plugin, userSettings, projectSettings, flagSettings, and
-policySettings agents into one map keyed by agent type, sorted alphabetically.
+The registry unions built-in, plugin, userSettings, projectSettings,
+flagSettings, and policySettings agents into one map keyed by agent type, sorted
+alphabetically.
 That is the list surfaced to the model and shown in the fleet view.
 
 A user-defined agent is therefore a genuine peer of the built-ins, not a
-second-class entry. Built-in types are hardcoded in the binary, not files, and
-`~/.claude/agents/` does not exist on this machine yet.
+second-class entry. Built-in types are hardcoded in the binary, not files. `~/.claude/agents/`
+may not exist until you create it.
 
 ## What the fleet view shows
 
@@ -328,9 +326,9 @@ has to be expressed in prose the wrapper interprets.
 
 1. Build it as a **user agent** in `~/.claude/agents/`, not a plugin agent.
    `permissionMode` is the deciding capability.
-2. The body launches `codex exec` as a **background Bash child**, then returns
-   its output. That sidesteps the 10 minute cap and keeps the fleet row alive
-   for the true duration.
+2. The body **detaches** `codex exec` with `setsid`, then blocks in foreground
+   `wait` calls each under the 10 minute cap. A background Bash child does not
+   work: it is killed when the agent's turn ends, as shown above.
 3. `codex exec -o <file>` writes the final answer to disk, so the agent returns
    a bounded summary and a path rather than dumping 36 KB into context.
 4. `SendMessage` continuation maps to `codex exec resume <SESSION_ID>`, and the
