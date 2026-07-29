@@ -46,8 +46,10 @@ which npm already implies, plus two things **npm does not install**:
 `npm install` prints which of these are present or missing, and
 `codex-subagent check` re-runs that report at any time.
 
-Linux, macOS, and Windows. Developed against `codex-cli 0.145.0` and Claude Code
-2.1.220 on Linux; CI covers all three platforms on Node 18, 20, and 22.
+Developed and tested against `codex-cli 0.145.0` and Claude Code 2.1.220 on
+Linux. The code is platform-neutral and CI is configured for Linux, macOS, and
+Windows on Node 18, 20, and 22, but macOS and Windows are not yet confirmed by a
+real run.
 
 ## Install
 
@@ -201,8 +203,14 @@ enter the conversation; `--output-schema` gives structured output;
 the working root; and `-c` reaches any config key, including
 `sandbox_workspace_write.network_access`.
 
-`docs/` contains the research this was built from: how Claude Code subagents
-work at the harness level, and what the official Codex plugin can and cannot do.
+More detail in `docs/`:
+
+- [`design.md`](docs/design.md) — every load-bearing decision and the constraint
+  that forced it
+- [`claude-code-subagents.md`](docs/claude-code-subagents.md) — harness
+  behaviour this depends on, including the one that dictates the whole design
+- [`codex-cli.md`](docs/codex-cli.md) — `codex exec` behaviour relied on or
+  worked around, notably three sharp edges in `resume`
 
 ## Limitations
 

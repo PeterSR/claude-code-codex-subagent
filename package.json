@@ -45,7 +45,7 @@
     "access": "public"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test",
     "lint": "node --check bin/codex-subagent",
     "postinstall": "node scripts/postinstall.mjs || true"
   },
