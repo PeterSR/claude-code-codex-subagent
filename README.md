@@ -69,8 +69,14 @@ if a `codex.md` you wrote by hand is already there.
 codex-subagent status      # what is installed, and does it still work
 codex-subagent check       # verify prerequisites only
 codex-subagent uninstall   # remove the agent, keep run directories
-codex-subagent purge       # remove the agent and all run directories
+codex-subagent purge       # also remove run directories (asks first)
 ```
+
+`purge` prints an itemised plan and asks before deleting anything, since run
+directories hold your prompts and Codex's answers. `--dry-run` previews it and
+`--yes` skips the prompt for scripts. Without a terminal to confirm at, it
+refuses rather than assuming yes. `uninstall` has no prompt: it removes one file
+this package created, and reinstalling costs nothing.
 
 To update: `npm update -g claude-code-codex-subagent`. Global packages keep a
 stable directory across versions, so the installed agent keeps working; the
@@ -79,14 +85,17 @@ update re-runs the install step anyway.
 To remove, **in this order**:
 
 ```bash
-codex-subagent purge                              # agent + run directories
+codex-subagent purge                              # agent + run directories, asks first
 npm uninstall -g claude-code-codex-subagent
 ```
 
 npm v7 removed uninstall lifecycle scripts, so the package cannot clean up after
-itself. If you uninstall in the other order the agent file is orphaned; it will
-then report that it has lost its launcher and tell you how to fix it, rather
-than failing obscurely.
+itself. This mirrors Claude Code's own uninstall, which is likewise two stages:
+remove the program with whatever installed it, then remove configuration as a
+separate, deliberately warned step.
+
+If you uninstall in the other order the agent file is orphaned. It then reports
+that it has lost its launcher and how to fix it, rather than failing obscurely.
 
 From a clone instead, use `node bin/codex-subagent install`. Paths are baked in
 at install time, so re-run it if you move the checkout, or after an npm upgrade

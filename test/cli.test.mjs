@@ -167,12 +167,32 @@ test("install lifecycle", async (t) => {
     assert.match(cli(["uninstall"]).out, /nothing to remove/i);
   });
 
-  await t.test("purge removes run directories too", () => {
+  await t.test("purge refuses to run unattended without --yes", () => {
     cli(["install"]);
     const runs = path.join(TMP, "cache", "codex-subagent", "some-run");
     fs.mkdirSync(runs, { recursive: true });
-    assert.equal(cli(["purge"]).code, 0);
+    const r = cli(["purge"]);            // no TTY in a spawned test
+    assert.equal(r.code, 64);
+    assert.match(r.out, /Refusing to purge/);
+    assert.ok(fs.existsSync(runs), "purge deleted without confirmation");
+  });
+
+  await t.test("purge --dry-run itemises without deleting", () => {
+    const runs = path.join(TMP, "cache", "codex-subagent", "some-run");
+    const r = cli(["purge", "--dry-run"]);
+    assert.equal(r.code, 0);
+    assert.match(r.out, /This will delete:/);
+    assert.match(r.out, /run director/);
+    assert.match(r.out, /Dry run, nothing was deleted/);
+    assert.ok(fs.existsSync(runs), "dry run deleted something");
+    assert.ok(fs.existsSync(agentPath()), "dry run removed the agent");
+  });
+
+  await t.test("purge --yes removes the agent and run directories", () => {
+    const runs = path.join(TMP, "cache", "codex-subagent", "some-run");
+    assert.equal(cli(["purge", "--yes"]).code, 0);
     assert.ok(!fs.existsSync(runs), "run directory survived purge");
+    assert.ok(!fs.existsSync(agentPath()), "agent survived purge");
   });
 });
 

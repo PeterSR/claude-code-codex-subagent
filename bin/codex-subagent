@@ -36,7 +36,7 @@ Manage:
   uninstall [--force] remove it (keeps run directories)
   status              what is installed, and does it still work
   check               verify external prerequisites
-  purge [--force]     remove the agent and all run directories
+  purge [--dry-run] [--yes]  remove the agent and all run directories
 
 Options for start/run:
   --sandbox <read-only|workspace-write|danger-full-access>   default: workspace-write
@@ -452,14 +452,55 @@ function cmdUninstall(argv) {
   return EX_OK;
 }
 
-function cmdPurge(argv) {
-  const rc = cmdUninstall(argv);
-  if (rc !== EX_OK) return rc;
+// Purge has a wider blast radius than uninstall, so it follows Claude Code's
+// own convention for destructive scoped cleanup: print an itemised plan, then
+// gate it behind one confirmation. --dry-run previews, --yes skips the prompt.
+async function cmdPurge(argv) {
+  const force = argv.includes("--force");
+  const dryRun = argv.includes("--dry-run");
+  const assumeYes = argv.includes("--yes") || argv.includes("-y");
+  for (const a of argv) {
+    if (!["--force", "--dry-run", "--yes", "-y"].includes(a)) die(`unknown option: ${a}`);
+  }
+
+  const target = agentTarget();
   const dir = runsDir();
-  if (!exists(dir)) { out("No run directories to remove."); return EX_OK; }
-  const n = fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).length;
-  fs.rmSync(dir, { recursive: true, force: true });
-  out(`Removed ${n} run director${n === 1 ? "y" : "ies"} from ${dir}`);
+  const plan = [];
+
+  if (exists(target) && (ownsTarget() || force)) plan.push([target, "the agent this package installed"]);
+  else if (exists(target)) plan.push([target, "SKIPPED, not created by this package (use --force)"]);
+
+  const runs = exists(dir)
+    ? fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory())
+    : [];
+  if (runs.length) plan.push([dir, `${runs.length} run director${runs.length === 1 ? "y" : "ies"}, including prompts and answers`]);
+
+  const actionable = plan.filter(([, why]) => !why.startsWith("SKIPPED"));
+  if (!actionable.length) { out("Nothing to remove."); return EX_OK; }
+
+  out("This will delete:");
+  for (const [p, why] of plan) out(`  ${p}\n      ${why}`);
+
+  if (dryRun) { out("\nDry run, nothing was deleted."); return EX_OK; }
+
+  if (!assumeYes) {
+    if (!process.stdin.isTTY) {
+      out("\nRefusing to purge without a terminal to confirm at. Re-run with --yes.");
+      return EX_USAGE;
+    }
+    process.stdout.write("\nDelete these? This cannot be undone. [y/N] ");
+    const answer = await new Promise((resolve) => {
+      process.stdin.setEncoding("utf8");
+      process.stdin.once("data", (d) => resolve(String(d).trim().toLowerCase()));
+    });
+    if (answer !== "y" && answer !== "yes") { out("Aborted, nothing was deleted."); return EX_OK; }
+  }
+
+  for (const [p, why] of plan) {
+    if (why.startsWith("SKIPPED")) continue;
+    fs.rmSync(p, { recursive: true, force: true });
+    out(`Removed ${p}`);
+  }
   return EX_OK;
 }
 
@@ -478,7 +519,7 @@ switch (sub) {
   case "run":       process.exit(await cmdWait([await startRun(rest)])); break;
   case "install":   process.exit(cmdInstall(rest)); break;
   case "uninstall": process.exit(cmdUninstall(rest)); break;
-  case "purge":     process.exit(cmdPurge(rest)); break;
+  case "purge":     process.exit(await cmdPurge(rest)); break;
   case "status":    process.exit(cmdStatus()); break;
   case "check":     process.exit(cmdCheck()); break;
   default: die(`unknown subcommand: ${sub}`);
