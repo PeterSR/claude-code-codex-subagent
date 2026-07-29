@@ -442,7 +442,12 @@ function cmdInstall(argv) {
   // Replace rather than write through a symlink, so we never edit its target.
   if (stat && stat.isSymbolicLink()) fs.unlinkSync(target);
 
-  let body = template.split(PLUGIN_ROOT_TOKEN).join(ROOT);
+  // The template joins the token to its suffix with a forward slash, so
+  // substituting a backslashed Windows root would yield a mixed path that
+  // cmd.exe refuses to execute. Forward slashes work in Git Bash, PowerShell,
+  // and every Node fs call, so normalise rather than patch the separators up.
+  const rootForShell = ROOT.split(path.sep).join("/");
+  let body = template.split(PLUGIN_ROOT_TOKEN).join(rootForShell);
   if (body.includes("CLAUDE_PLUGIN_ROOT")) die("unsubstituted plugin-root reference remains in rendered agent");
   body += `\n<!-- ${MARKER} from ${ROOT} -->\n`;
 

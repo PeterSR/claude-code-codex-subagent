@@ -139,7 +139,9 @@ test("install lifecycle", async (t) => {
     const body = fs.readFileSync(agentPath(), "utf8");
     assert.match(body, /installed-by: claude-code-codex-subagent/);
     assert.ok(!body.includes("CLAUDE_PLUGIN_ROOT"), "plugin-root token survived");
-    assert.ok(body.includes(path.join(ROOT, "bin", "codex-subagent")), "launcher path not baked in");
+    const rootForShell = ROOT.split(path.sep).join("/");
+    assert.ok(body.includes(`${rootForShell}/bin/codex-subagent`), "launcher path not baked in");
+    assert.ok(!/[A-Za-z]:\\[^\n]*\//.test(body), "rendered agent mixes path separators");
   });
 
   await t.test("reinstall is idempotent", () => {
