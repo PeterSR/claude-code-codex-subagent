@@ -29,6 +29,21 @@
 
 set -uo pipefail
 
+# Resolve this script's real directory, following symlinks. npm -g installs a
+# symlink into its bin directory, so BASH_SOURCE alone points at the wrong place.
+resolve_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+SELF_DIR="$(resolve_dir)"
+INSTALLER="$SELF_DIR/../install.sh"
+
 die() { printf 'codex-subagent: %s\n' "$1" >&2; exit 64; }
 
 # Validate that an option has a real value. Guards three separate bugs: a
@@ -256,6 +271,11 @@ case "$1" in
   -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
   start)     shift; do_start "$@" ;;
   wait)      shift; do_wait "$@" ;;
+  install)   shift; exec bash "$INSTALLER" "$@" ;;
+  uninstall) shift; exec bash "$INSTALLER" --uninstall "$@" ;;
+  status)    shift; exec bash "$INSTALLER" --status "$@" ;;
+  check)     shift; exec bash "$INSTALLER" --check "$@" ;;
+  purge)     shift; exec bash "$INSTALLER" --purge "$@" ;;
   run)
     shift
     RD="$(do_start "$@")" || exit $?

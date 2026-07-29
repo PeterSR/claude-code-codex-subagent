@@ -1,0 +1,57 @@
+{
+  "name": "claude-code-codex-subagent",
+  "version": "0.1.0",
+  "description": "Run OpenAI Codex as a first-class Claude Code subagent",
+  "keywords": [
+    "claude-code",
+    "claude",
+    "codex",
+    "openai",
+    "subagent",
+    "agents",
+    "code-review"
+  ],
+  "bin": {
+    "codex-subagent": "bin/codex-subagent"
+  },
+  "files": [
+    "bin",
+    "agents",
+    "schemas",
+    "docs",
+    "scripts",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "Peter Severin Rasmussen",
+  "homepage": "https://github.com/PeterSR/claude-code-codex-subagent",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeterSR/claude-code-codex-subagent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeterSR/claude-code-codex-subagent/issues"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "bash test/run.sh",
+    "lint": "shellcheck bin/codex-subagent install.sh && bash -n bin/codex-subagent && bash -n install.sh",
+    "postinstall": "bash scripts/postinstall.sh || true"
+  },
+  "externalDependencies": {
+    "codex": "OpenAI Codex CLI, npm install -g @openai/codex",
+    "setsid": "util-linux, used to detach runs",
+    "claude": "Claude Code"
+  }
+}

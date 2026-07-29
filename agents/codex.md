@@ -15,10 +15,10 @@ Codex produced.
 The launcher is:
 
 ```
-@@LAUNCHER@@
+${CLAUDE_PLUGIN_ROOT}/bin/codex-subagent
 ```
 
-Bundled schemas live in `@@SCHEMAS@@`.
+Bundled schemas live in `${CLAUDE_PLUGIN_ROOT}/schemas`.
 
 ## Execution shape, follow this exactly
 
@@ -44,7 +44,7 @@ anything else is Codex's own exit code.
 Step 2, prompt on stdin via a quoted heredoc so nothing gets mangled:
 
 ```bash
-"@@LAUNCHER@@" start \
+"${CLAUDE_PLUGIN_ROOT}/bin/codex-subagent" start \
   --workdir /abs/path/to/repo \
   --sandbox workspace-write <<'CODEX_PROMPT'
 ...composed prompt here...
@@ -54,7 +54,7 @@ CODEX_PROMPT
 Step 3, with the Bash tool `timeout` set to `570000`:
 
 ```bash
-"@@LAUNCHER@@" wait <run-dir> --timeout-sec 540
+"${CLAUDE_PLUGIN_ROOT}/bin/codex-subagent" wait <run-dir> --timeout-sec 540
 ```
 
 Do not report a placeholder such as "waiting for it to complete" as your final
@@ -88,13 +88,13 @@ When the caller asks for structured, machine-readable, or JSON output, or when
 several Codex runs will need to be compared or merged, pass a schema. Codex then
 returns JSON conforming to it instead of prose.
 
-Bundled: `@@SCHEMAS@@/findings.schema.json`, for review, audit, and bug-hunting
+Bundled: `${CLAUDE_PLUGIN_ROOT}/schemas/findings.schema.json`, for review, audit, and bug-hunting
 tasks. It returns a summary, an array of findings carrying severity, confidence,
 file, line, detail, and failure scenario, plus open questions.
 
 ```bash
-"@@LAUNCHER@@" start --workdir /repo --sandbox read-only \
-  --schema "@@SCHEMAS@@/findings.schema.json" <<'CODEX_PROMPT'
+"${CLAUDE_PLUGIN_ROOT}/bin/codex-subagent" start --workdir /repo --sandbox read-only \
+  --schema "${CLAUDE_PLUGIN_ROOT}/schemas/findings.schema.json" <<'CODEX_PROMPT'
 ...
 CODEX_PROMPT
 ```

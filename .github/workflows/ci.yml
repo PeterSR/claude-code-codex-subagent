@@ -6,24 +6,23 @@ on:
   pull_request:
 
 jobs:
-  shell:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Syntax check
+      - name: Lint
         run: |
+          shellcheck bin/codex-subagent install.sh scripts/postinstall.sh test/run.sh
           bash -n bin/codex-subagent
           bash -n install.sh
 
-      - name: ShellCheck
-        run: shellcheck bin/codex-subagent install.sh
-
-      - name: Agent template has no unsubstituted paths
+      - name: No absolute home paths in shipped files
         run: |
-          grep -q '@@LAUNCHER@@' agents/codex.md
-          grep -q '@@SCHEMAS@@' agents/codex.md
-          ! grep -qE '/home/|/Users/' agents/codex.md bin/codex-subagent install.sh
+          ! grep -rqE '/home/[a-z]|/Users/[a-z]' bin agents schemas install.sh scripts
+
+      - name: Agent template keeps its plugin-root token
+        run: grep -q 'CLAUDE_PLUGIN_ROOT' agents/codex.md
 
       - name: Schemas are valid JSON
         run: |
@@ -31,13 +30,19 @@ jobs:
             python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
           done
 
-      - name: Install and uninstall round-trip
+      - name: Test suite
+        run: bash test/run.sh
+
+      - name: Package installs globally and resolves through its symlink
         run: |
+          npm pack
+          npm install -g "./$(ls *.tgz | head -1)"
+          codex-subagent --help > /dev/null
+          codex-subagent check || true   # codex CLI is absent in CI
           export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude"
-          ./install.sh || true          # codex CLI is absent in CI; install still writes the agent
+          codex-subagent install
           test -f "$CLAUDE_CONFIG_DIR/agents/codex.md"
-          ! grep -q '@@' "$CLAUDE_CONFIG_DIR/agents/codex.md"
-          ./install.sh                  # idempotent
-          ./install.sh --status
-          ./install.sh --uninstall
+          ! grep -q 'CLAUDE_PLUGIN_ROOT' "$CLAUDE_CONFIG_DIR/agents/codex.md"
+          codex-subagent status
+          codex-subagent uninstall
           test ! -f "$CLAUDE_CONFIG_DIR/agents/codex.md"

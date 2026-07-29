@@ -16,9 +16,21 @@
 
 set -uo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve this script's real directory, following symlinks. npm -g installs a
+# symlink into its bin directory, so BASH_SOURCE alone points at the wrong place.
+resolve_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+
+REPO="$(resolve_dir)"
 LAUNCHER="$REPO/bin/codex-subagent"
-SCHEMAS="$REPO/schemas"
 SOURCE_AGENT="$REPO/agents/codex.md"
 TARGET_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/agents"
 TARGET="$TARGET_DIR/codex.md"
@@ -152,11 +164,10 @@ install_agent() {
   # characters it treats specially, such as | or &.
   local body
   body="$(cat "$SOURCE_AGENT")" || die "cannot read $SOURCE_AGENT"
-  body="${body//@@LAUNCHER@@/$LAUNCHER}"
-  body="${body//@@SCHEMAS@@/$SCHEMAS}"
+  body="${body//\$\{CLAUDE_PLUGIN_ROOT\}/$REPO}"
 
   case "$body" in
-    *@@*) die "unsubstituted placeholder remains in rendered agent" ;;
+    *CLAUDE_PLUGIN_ROOT*) die "unsubstituted plugin-root reference remains in rendered agent" ;;
   esac
 
   local tmp="$TARGET.tmp.$$"

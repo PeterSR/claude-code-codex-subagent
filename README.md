@@ -35,37 +35,48 @@ quick human-driven ask. This adds a second lane beside it.
 
 ## Requirements
 
-- [Claude Code](https://claude.com/claude-code)
-- [Codex CLI](https://github.com/openai/codex) on `PATH`, authenticated
-  (`npm install -g @openai/codex`, then run `codex` once to sign in)
-- `setsid` (util-linux), used to detach runs
-- Bash 3.2 or newer
+This package is a Bash launcher plus an agent definition. It bundles no runtime,
+and **npm installs none of the following**. They must already be present:
 
-Developed against `codex-cli 0.145.0` and Claude Code 2.1.220 on Linux. macOS
-should work but `setsid` is not present by default there; see Limitations.
+| Needed | Why | Get it |
+| --- | --- | --- |
+| [Claude Code](https://claude.com/claude-code) | the host the agent runs in | see link |
+| [Codex CLI](https://github.com/openai/codex), authenticated | does the actual work | `npm install -g @openai/codex`, then run `codex` once to sign in |
+| `setsid` | detaches runs so they survive the agent's turn ending | util-linux; preinstalled on Linux, `brew install util-linux` on macOS |
+| Bash 3.2 or newer | the launcher and installer are Bash | preinstalled |
+
+`npm install` prints which of these are present or missing, and
+`codex-subagent check` re-runs that report at any time.
+
+Developed against `codex-cli 0.145.0` and Claude Code 2.1.220 on Linux.
 
 ## Install
 
 ```bash
-git clone https://github.com/PeterSR/claude-code-codex-subagent
-cd claude-code-codex-subagent
-./install.sh
+npm install -g claude-code-codex-subagent
+codex-subagent install
 ```
 
-This writes `~/.claude/agents/codex.md` with this checkout's absolute paths
-baked in, so nothing depends on `PATH`. **Restart Claude Code afterwards**, since
-the agent registry is read at session start.
+The second step writes `~/.claude/agents/codex.md`, pointing at the installed
+package. **Restart Claude Code afterwards**, since the agent registry is read at
+session start.
 
 ```bash
-./install.sh --status      # what is installed, and does it still work
-./install.sh --check       # verify prerequisites only
-./install.sh --uninstall   # remove the agent, keep run directories
-./install.sh --purge       # remove the agent and all run directories
+codex-subagent status      # what is installed, and does it still work
+codex-subagent check       # verify prerequisites only
+codex-subagent uninstall   # remove the agent, keep run directories
+codex-subagent purge       # remove the agent and all run directories
 ```
 
-Because paths are baked in, **re-run `./install.sh` if you move or rename the
-checkout**. `--status` detects that case and tells you so rather than leaving you
-with an agent that fails mysteriously.
+To update: `npm update -g claude-code-codex-subagent`, then
+`codex-subagent install` again to re-point the agent at the new version.
+
+To remove entirely: `codex-subagent purge && npm uninstall -g claude-code-codex-subagent`.
+
+From a clone instead, `./install.sh` takes the same flags with `--` prefixes
+(`./install.sh --status`). Paths are baked in at install time, so re-run it if
+you move or rename the checkout. `status` detects that case and says so rather
+than leaving you with an agent that fails mysteriously.
 
 The installer marks the file it generates, so it will not clobber or delete a
 `codex.md` you wrote yourself; pass `--force` to override, which backs up the
@@ -191,6 +202,24 @@ work at the harness level, and what the official Codex plugin can and cannot do.
 - **Trust but verify.** Codex has been observed reporting tests passing on a run
   where the patch was never applied. The agent is instructed to relay such
   claims as claims. Read the diff.
+
+## Why this is not a Claude Code plugin
+
+`/plugin install` would be a nicer install, and this was built as a plugin first.
+Claude Code's loader silently drops `permissionMode`, `hooks`, and `mcpServers`
+from plugin-provided agents. Without `permissionMode`, an unattended dispatch can
+stall waiting for a permission prompt instead of running, and the obvious
+workaround, allowlisting the launcher path, breaks on every update because the
+plugin cache path contains the version number.
+
+Everything else about a plugin agent is equivalent, including the fleet-view row
+and auto-delegation. It is specifically those three dropped fields that make a
+user agent the right home for this.
+
+A companion plugin could still make sense later for things that lose nothing:
+slash commands for inspecting and cleaning run directories, and a skill covering
+multi-job Codex orchestration. Neither of those is an agent, so neither is
+affected. That is not built yet.
 
 ## Security
 
