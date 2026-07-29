@@ -1,285 +1,485 @@
-#!/usr/bin/env bash
-# codex-subagent: run Codex on behalf of the Claude Code `codex` subagent.
-#
-# Subcommands:
-#   start [options]                    launch detached, print run dir, exit
-#   wait <run-dir> [--timeout-sec N]   block until finished or N seconds pass
-#   run [options]                      start then wait
-#
-# The prompt is read from stdin (or --prompt-file) by `start` and `run`.
-#
-# Codex is launched with setsid so it survives the caller's process group being
-# torn down. A subagent's background Bash child IS killed when its turn ends, so
-# the agent must `start` (detached), then `wait` in foreground chunks that each
-# stay under the Bash tool's 600000 ms cap.
-#
-# Options for start/run:
-#   --sandbox <read-only|workspace-write|danger-full-access>   default: workspace-write
-#   --no-network            disable network (default: enabled for workspace-write)
-#   --model <name>          default: unset, inherits ~/.codex/config.toml
-#   --effort <none|minimal|low|medium|high|xhigh>
-#   --workdir <dir>         working root; default: $PWD. Ignored when resuming.
-#   --resume <thread-id>    continue an existing Codex thread
-#   --schema <file>         JSON Schema for structured final output
-#   --prompt-file <file>    read prompt from a file instead of stdin
-#   --run-dir <dir>         override run directory location (must not be reused)
-#
-# Exit codes: 0 success, 64 usage error, 70 run died, 75 not finished yet,
-# otherwise Codex's own exit code.
+#!/usr/bin/env node
+// codex-subagent: run Codex on behalf of the Claude Code `codex` subagent,
+// and install/remove the agent definition.
+//
+// No dependencies, no shell. Codex is launched as a detached child so the run
+// survives the caller's process group being torn down: a subagent's background
+// child is killed when its turn ends, so the agent must `start` (detached) and
+// then `wait` in foreground chunks under the Bash tool's 600000 ms cap.
+//
+// Exit codes: 0 success, 64 usage error, 70 run died, 75 not finished yet,
+// otherwise Codex's own exit code.
 
-set -uo pipefail
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-# Resolve this script's real directory, following symlinks. npm -g installs a
-# symlink into its bin directory, so BASH_SOURCE alone points at the wrong place.
-resolve_dir() {
-  local src="${BASH_SOURCE[0]}" dir
-  while [ -L "$src" ]; do
-    dir="$(cd -P "$(dirname "$src")" && pwd)"
-    src="$(readlink "$src")"
-    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
-  done
-  cd -P "$(dirname "$src")" && pwd
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, "..");
+const AGENT_SOURCE = path.join(ROOT, "agents", "codex.md");
+const MARKER = "installed-by: claude-code-codex-subagent";
+const PLUGIN_ROOT_TOKEN = "${CLAUDE_PLUGIN_ROOT}";
+
+const EX_OK = 0, EX_USAGE = 64, EX_DIED = 70, EX_UNFINISHED = 75;
+
+const USAGE = `codex-subagent
+
+Run:
+  start [options]                    launch detached, print run dir, exit
+  wait <run-dir> [--timeout-sec N]   block until finished or N seconds pass
+  run [options]                      start then wait
+
+Manage:
+  install [--force]   write the agent into Claude Code
+  uninstall [--force] remove it (keeps run directories)
+  status              what is installed, and does it still work
+  check               verify external prerequisites
+  purge [--force]     remove the agent and all run directories
+
+Options for start/run:
+  --sandbox <read-only|workspace-write|danger-full-access>   default: workspace-write
+  --no-network            disable network (default: enabled for workspace-write)
+  --model <name>          default: unset, inherits the codex config
+  --effort <none|minimal|low|medium|high|xhigh>
+  --workdir <dir>         working root; default: cwd. Ignored when resuming.
+  --resume <thread-id>    continue an existing Codex thread
+  --schema <file>         JSON Schema for structured final output
+  --prompt-file <file>    read the prompt from a file instead of stdin
+  --run-dir <dir>         override run directory location (must not be reused)
+
+Exit codes: 0 ok, 64 usage, 70 run died, 75 not finished, else Codex's own.`;
+
+function die(msg) {
+  process.stderr.write(`codex-subagent: ${msg}\n`);
+  process.exit(EX_USAGE);
 }
 
-SELF_DIR="$(resolve_dir)"
-INSTALLER="$SELF_DIR/../install.sh"
+const out = (s) => process.stdout.write(s + "\n");
+const ok = (s) => out(`  ok    ${s}`);
+const warn = (s) => out(`  warn  ${s}`);
+const bad = (s) => out(`  FAIL  ${s}`);
 
-die() { printf 'codex-subagent: %s\n' "$1" >&2; exit 64; }
-
-# Validate that an option has a real value. Guards three separate bugs: a
-# trailing flag with no value would make `shift 2` fail and, without `set -e`,
-# spin the parse loop forever; an empty value would silently take a default; and
-# a following option would be swallowed as the value (`--resume --last` used to
-# resume the newest thread instead of erroring).
-need_val() {
-  local flag="$1" remaining="$2" value="${3-}"
-  [ "$remaining" -ge 2 ] || die "$flag requires a value"
-  [ -n "$value" ] || die "$flag requires a non-empty value"
-  case "$value" in
-    -*) die "$flag requires a value but got another option: $value" ;;
-  esac
+function runsDir() {
+  const base = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+  return path.join(base, "codex-subagent");
+}
+function agentTarget() {
+  const base = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+  return path.join(base, "agents", "codex.md");
+}
+function codexHome() {
+  return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 }
 
-# ---------------------------------------------------------------- report ----
-emit_report() {
-  local RUN_DIR="$1"
-  local EXIT ANSWER THREAD BYTES
-  ANSWER="$RUN_DIR/answer.md"
-  EXIT="$(cat "$RUN_DIR/exit" 2>/dev/null || echo "")"
-  THREAD="$(grep -o '"thread_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$RUN_DIR/events.jsonl" 2>/dev/null \
-            | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
-  [ -n "$THREAD" ] || THREAD="$(cat "$RUN_DIR/resume-id" 2>/dev/null || echo "")"
-  BYTES=0
-  [ -f "$ANSWER" ] && BYTES=$(wc -c < "$ANSWER" | tr -d ' ')
-
-  echo "=== codex-subagent ==="
-  echo "status:    $([ -n "$EXIT" ] && echo "finished (exit $EXIT)" || echo "STILL RUNNING")"
-  echo "thread_id: ${THREAD:-unknown}"
-  echo "run_dir:   $RUN_DIR"
-  [ -f "$RUN_DIR/meta.txt" ] && cat "$RUN_DIR/meta.txt"
-  echo "answer:    $ANSWER ($BYTES bytes)"
-
-  if [ -n "$EXIT" ] && [ "$EXIT" != "0" ]; then
-    echo
-    echo "--- stderr (tail) ---"
-    tail -20 "$RUN_DIR/stderr.txt" 2>/dev/null
-    echo "--- last events ---"
-    tail -3 "$RUN_DIR/events.jsonl" 2>/dev/null | cut -c1-300
-  fi
-
-  if [ "$BYTES" -gt 0 ]; then
-    echo
-    if [ "$BYTES" -le 30000 ]; then
-      echo "--- answer ---"
-      cat "$ANSWER"
-    else
-      echo "--- answer (truncated, $BYTES bytes; Read the full file at the path above) ---"
-      head -c 8000 "$ANSWER"
-      printf '\n[...truncated...]\n'
-    fi
-  fi
+function onPath(cmd) {
+  const exts = process.platform === "win32"
+    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";")
+    : [""];
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const p = path.join(dir, cmd + ext);
+      try {
+        fs.accessSync(p, fs.constants.X_OK);
+        return p;
+      } catch { /* keep looking */ }
+    }
+  }
+  return null;
 }
 
-# Is the detached run still alive? Distinguishes "still working" from "died
-# without ever writing a completion marker", which otherwise loops forever.
-run_alive() {
-  local RUN_DIR="$1" PID
-  PID="$(cat "$RUN_DIR/pid" 2>/dev/null || echo "")"
-  [ -n "$PID" ] || return 1
-  kill -0 "$PID" 2>/dev/null
+const read = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
+const exists = (f) => { try { fs.statSync(f); return true; } catch { return false; } };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Parse options. Guards the three argument bugs the Bash version had: a
+// trailing flag with no value, an empty value silently taking a default, and a
+// following option being swallowed as the value (`--resume --last`).
+function parseOptions(argv, spec) {
+  const opts = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const kind = spec[arg];
+    if (!kind) die(`unknown option: ${arg}`);
+    if (kind === "flag") { opts[arg] = true; continue; }
+    const value = argv[i + 1];
+    if (value === undefined) die(`${arg} requires a value`);
+    if (value === "") die(`${arg} requires a non-empty value`);
+    if (value.startsWith("-")) die(`${arg} requires a value but got another option: ${value}`);
+    opts[arg] = value;
+    i++;
+  }
+  return opts;
 }
 
-# ------------------------------------------------------------------ wait ----
-do_wait() {
-  local RUN_DIR="${1:-}"
-  shift || true
-  local TIMEOUT=540
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --timeout-sec) need_val "$1" $# "${2-}"; TIMEOUT="$2"; shift 2 ;;
-      *) die "wait: unknown option: $1" ;;
-    esac
-  done
-  [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || die "wait: run dir not found: ${RUN_DIR:-<missing>}"
-  case "$TIMEOUT" in
-    ''|*[!0-9]*) die "--timeout-sec must be a non-negative integer, got: $TIMEOUT" ;;
-  esac
+// ------------------------------------------------------------------ start ---
+const START_SPEC = {
+  "--sandbox": "value", "--model": "value", "--effort": "value",
+  "--workdir": "value", "--resume": "value", "--schema": "value",
+  "--prompt-file": "value", "--run-dir": "value", "--no-network": "flag",
+};
 
-  local WAITED=0 STEP
-  while [ ! -f "$RUN_DIR/exit" ] && [ "$WAITED" -lt "$TIMEOUT" ]; do
-    # Never overshoot the caller's budget; it may be sized against a hard cap.
-    STEP=$((TIMEOUT - WAITED))
-    [ "$STEP" -gt 5 ] && STEP=5
-    sleep "$STEP"
-    WAITED=$((WAITED + STEP))
-    # Detect a run that died without writing a marker.
-    if [ ! -f "$RUN_DIR/exit" ] && ! run_alive "$RUN_DIR"; then
-      sleep 1   # let a just-finished writer land its marker
-      if [ ! -f "$RUN_DIR/exit" ]; then
-        emit_report "$RUN_DIR"
-        echo
-        echo "RUN DIED without writing a completion marker. Check $RUN_DIR/stderr.txt"
-        return 70
-      fi
-    fi
-  done
-
-  emit_report "$RUN_DIR"
-
-  if [ ! -f "$RUN_DIR/exit" ]; then
-    echo
-    echo "NOT FINISHED after ${WAITED}s. Codex is still running (detached)."
-    printf 'Call again: %s wait %q\n' "$0" "$RUN_DIR"
-    return 75
-  fi
-
-  local CODE
-  CODE="$(cat "$RUN_DIR/exit" 2>/dev/null || echo "")"
-  case "$CODE" in
-    ''|*[!0-9]*) return 70 ;;
-  esac
-  return "$CODE"
+function readStdin() {
+  if (process.stdin.isTTY) {
+    die("no prompt: pipe one on stdin or pass --prompt-file");
+  }
+  try {
+    return fs.readFileSync(0, "utf8");
+  } catch {
+    return "";
+  }
 }
 
-# ----------------------------------------------------------------- start ----
-do_start() {
-  local SANDBOX="workspace-write" NETWORK="true" MODEL="" EFFORT=""
-  local WORKDIR="$PWD" RESUME="" SCHEMA="" PROMPT_FILE="" RUN_DIR=""
-
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --sandbox)     need_val "$1" $# "${2-}"; SANDBOX="$2"; shift 2 ;;
-      --model)       need_val "$1" $# "${2-}"; MODEL="$2"; shift 2 ;;
-      --effort)      need_val "$1" $# "${2-}"; EFFORT="$2"; shift 2 ;;
-      --workdir)     need_val "$1" $# "${2-}"; WORKDIR="$2"; shift 2 ;;
-      --resume)      need_val "$1" $# "${2-}"; RESUME="$2"; shift 2 ;;
-      --schema)      need_val "$1" $# "${2-}"; SCHEMA="$2"; shift 2 ;;
-      --prompt-file) need_val "$1" $# "${2-}"; PROMPT_FILE="$2"; shift 2 ;;
-      --run-dir)     need_val "$1" $# "${2-}"; RUN_DIR="$2"; shift 2 ;;
-      --no-network)  NETWORK="false"; shift ;;
-      *)             die "unknown option: $1" ;;
-    esac
-  done
-
-  command -v codex > /dev/null 2>&1 \
-    || die "the 'codex' CLI is not on PATH. Install it with: npm install -g @openai/codex"
-
-  case "$SANDBOX" in
-    read-only|workspace-write|danger-full-access) ;;
-    *) die "invalid --sandbox: $SANDBOX" ;;
-  esac
-  [ -n "$RESUME" ] || [ -d "$WORKDIR" ] || die "--workdir does not exist: $WORKDIR"
-  [ -z "$SCHEMA" ] || [ -f "$SCHEMA" ] || die "--schema file not found: $SCHEMA"
-
-  [ -n "$RUN_DIR" ] || RUN_DIR="$HOME/.cache/codex-subagent/$(date +%Y%m%d-%H%M%S)-$$"
-  # Refuse to reuse a directory that already holds a run. Reuse used to leave a
-  # stale `exit` marker in place, so `wait` returned the PREVIOUS run's answer
-  # immediately while the new run was still going.
-  if [ -e "$RUN_DIR/exit" ] || [ -e "$RUN_DIR/events.jsonl" ] || [ -e "$RUN_DIR/pid" ]; then
-    die "run dir already used, pick another: $RUN_DIR"
-  fi
-  mkdir -p "$RUN_DIR" || die "cannot create run dir: $RUN_DIR"
-
-  local PROMPT="$RUN_DIR/prompt.txt"
-  if [ -n "$PROMPT_FILE" ]; then
-    [ -f "$PROMPT_FILE" ] || die "--prompt-file not found: $PROMPT_FILE"
-    cp "$PROMPT_FILE" "$PROMPT"
-  else
-    cat > "$PROMPT"
-  fi
-  [ -s "$PROMPT" ] || die "empty prompt"
-
-  # `resume` accepts neither -s/--sandbox nor -C/--cd. Sandbox goes through -c,
-  # and the working root stays pinned to wherever the thread was born.
-  local cmd=(codex exec)
-  if [ -n "$RESUME" ]; then
-    cmd+=(resume "$RESUME" -c "sandbox_mode=$SANDBOX")
-    printf '%s' "$RESUME" > "$RUN_DIR/resume-id"
-  else
-    cmd+=(-s "$SANDBOX" -C "$WORKDIR")
-  fi
-  [ "$SANDBOX" = "workspace-write" ] && cmd+=(-c "sandbox_workspace_write.network_access=$NETWORK")
-  [ -n "$MODEL" ]  && cmd+=(-m "$MODEL")
-  [ -n "$EFFORT" ] && cmd+=(-c "model_reasoning_effort=$EFFORT")
-  [ -n "$SCHEMA" ] && cmd+=(--output-schema "$SCHEMA")
-  cmd+=(--json --skip-git-repo-check -o "$RUN_DIR/answer.md" -)
-
-  printf '%s\n' "${cmd[*]}" > "$RUN_DIR/command.txt"
-  {
-    echo "mode:      $([ -n "$RESUME" ] && echo resume || echo fresh)"
-    echo "sandbox:   $SANDBOX (network=$([ "$SANDBOX" = workspace-write ] && echo "$NETWORK" || echo n/a))"
-    echo "model:     ${MODEL:-<config default>}"
-    echo "workdir:   $([ -n "$RESUME" ] && echo '<pinned to original thread>' || echo "$WORKDIR")"
-  } > "$RUN_DIR/meta.txt"
-
-  # setsid detaches into a new session so the run survives the caller's process
-  # group being torn down when a subagent turn ends. The inner shell publishes
-  # its pid immediately (so a dead run is detectable) and writes the completion
-  # marker via an atomic rename (so a concurrent reader never sees it empty).
-  #
-  # The body is single-quoted deliberately: it is expanded by the inner shell,
-  # not by this one. Arguments arrive positionally after the `_` placeholder.
-  # shellcheck disable=SC2016
-  setsid nohup bash -c '
-    RUN_DIR="$1"; shift
-    echo $$ > "$RUN_DIR/pid"
-    "$@" < "$RUN_DIR/prompt.txt" > "$RUN_DIR/events.jsonl" 2> "$RUN_DIR/stderr.txt"
-    printf "%s" $? > "$RUN_DIR/exit.tmp"
-    mv -f "$RUN_DIR/exit.tmp" "$RUN_DIR/exit"
-  ' _ "$RUN_DIR" "${cmd[@]}" > /dev/null 2>&1 < /dev/null &
-  disown 2>/dev/null || true
-
-  # Health-check the launch. Without this, a failure in setsid/nohup/bash left a
-  # run dir that never gets a completion marker, so every later wait reported
-  # "still running" forever.
-  local TRIES=0
-  while [ ! -f "$RUN_DIR/pid" ] && [ ! -f "$RUN_DIR/exit" ] && [ "$TRIES" -lt 50 ]; do
-    sleep 0.1
-    TRIES=$((TRIES + 1))
-  done
-  if [ ! -f "$RUN_DIR/pid" ] && [ ! -f "$RUN_DIR/exit" ]; then
-    die "detached launch failed, no pid appeared in $RUN_DIR (is setsid available?)"
-  fi
-
-  echo "$RUN_DIR"
+function buildCodexArgs(cfg, runDir) {
+  const args = ["exec"];
+  if (cfg.resume) {
+    // `resume` accepts neither -s/--sandbox nor -C/--cd. The sandbox has to go
+    // through -c, and the working root stays pinned to wherever the thread was
+    // first created.
+    args.push("resume", cfg.resume, "-c", `sandbox_mode=${cfg.sandbox}`);
+  } else {
+    args.push("-s", cfg.sandbox, "-C", cfg.workdir);
+  }
+  if (cfg.sandbox === "workspace-write") {
+    args.push("-c", `sandbox_workspace_write.network_access=${cfg.network}`);
+  }
+  if (cfg.model) args.push("-m", cfg.model);
+  if (cfg.effort) args.push("-c", `model_reasoning_effort=${cfg.effort}`);
+  if (cfg.schema) args.push("--output-schema", cfg.schema);
+  args.push("--json", "--skip-git-repo-check", "-o", path.join(runDir, "answer.md"), "-");
+  return args;
 }
 
-# ------------------------------------------------------------------ main ----
-[ $# -gt 0 ] || die "no subcommand; try --help"
+async function startRun(argv) {
+  const o = parseOptions(argv, START_SPEC);
+  const cfg = {
+    sandbox: o["--sandbox"] || "workspace-write",
+    network: o["--no-network"] ? "false" : "true",
+    model: o["--model"] || "",
+    effort: o["--effort"] || "",
+    workdir: path.resolve(o["--workdir"] || process.cwd()),
+    resume: o["--resume"] || "",
+    schema: o["--schema"] || "",
+  };
 
-case "$1" in
-  -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
-  start)     shift; do_start "$@" ;;
-  wait)      shift; do_wait "$@" ;;
-  install)   shift; exec bash "$INSTALLER" "$@" ;;
-  uninstall) shift; exec bash "$INSTALLER" --uninstall "$@" ;;
-  status)    shift; exec bash "$INSTALLER" --status "$@" ;;
-  check)     shift; exec bash "$INSTALLER" --check "$@" ;;
-  purge)     shift; exec bash "$INSTALLER" --purge "$@" ;;
-  run)
-    shift
-    RD="$(do_start "$@")" || exit $?
-    do_wait "$RD"
-    ;;
-  *) die "unknown subcommand: $1" ;;
-esac
+  if (!onPath("codex")) {
+    die("the 'codex' CLI is not on PATH. Install it with: npm install -g @openai/codex");
+  }
+  if (!["read-only", "workspace-write", "danger-full-access"].includes(cfg.sandbox)) {
+    die(`invalid --sandbox: ${cfg.sandbox}`);
+  }
+  if (!cfg.resume && !exists(cfg.workdir)) die(`--workdir does not exist: ${cfg.workdir}`);
+  if (cfg.schema && !exists(cfg.schema)) die(`--schema file not found: ${cfg.schema}`);
+
+  const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  const runDir = o["--run-dir"] || path.join(runsDir(), `${stamp}-${process.pid}`);
+
+  // Refuse to reuse a directory that already holds a run: a stale `exit` marker
+  // made `wait` return the PREVIOUS run's answer immediately.
+  for (const f of ["exit", "events.jsonl", "pid"]) {
+    if (exists(path.join(runDir, f))) die(`run dir already used, pick another: ${runDir}`);
+  }
+  fs.mkdirSync(runDir, { recursive: true });
+
+  const promptFile = path.join(runDir, "prompt.txt");
+  let prompt;
+  if (o["--prompt-file"]) {
+    if (!exists(o["--prompt-file"])) die(`--prompt-file not found: ${o["--prompt-file"]}`);
+    prompt = fs.readFileSync(o["--prompt-file"], "utf8");
+  } else {
+    prompt = readStdin();
+  }
+  if (!prompt.trim()) die("empty prompt");
+  fs.writeFileSync(promptFile, prompt);
+
+  const args = buildCodexArgs(cfg, runDir);
+  fs.writeFileSync(path.join(runDir, "command.json"), JSON.stringify({ cmd: "codex", args }, null, 2));
+  fs.writeFileSync(path.join(runDir, "meta.json"), JSON.stringify({
+    mode: cfg.resume ? "resume" : "fresh",
+    sandbox: cfg.sandbox,
+    network: cfg.sandbox === "workspace-write" ? cfg.network : "n/a",
+    model: cfg.model || "<config default>",
+    workdir: cfg.resume ? "<pinned to original thread>" : cfg.workdir,
+  }, null, 2));
+  if (cfg.resume) fs.writeFileSync(path.join(runDir, "resume-id"), cfg.resume);
+
+  // A detached child in its own process group survives the parent's group being
+  // torn down. This replaces setsid and works on every platform Node supports.
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "__supervise", runDir], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  child.unref();
+
+  // Health-check the launch. Without this, a failure to spawn left a run dir
+  // that never got a completion marker, so every later wait said "still
+  // running" forever.
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline
+         && !exists(path.join(runDir, "pid"))
+         && !exists(path.join(runDir, "exit"))) {
+    await sleep(50);
+  }
+  if (!exists(path.join(runDir, "pid")) && !exists(path.join(runDir, "exit"))) {
+    die(`detached launch failed, no pid appeared in ${runDir}`);
+  }
+
+  return runDir;
+}
+
+// The supervisor runs detached. It owns the codex process, streams its output
+// to files, and publishes the completion marker via an atomic rename so a
+// concurrent reader never observes a half-written file.
+function cmdSupervise(argv) {
+  const runDir = argv[0];
+  if (!runDir || !exists(runDir)) process.exit(EX_USAGE);
+
+  fs.writeFileSync(path.join(runDir, "pid"), String(process.pid));
+
+  const { args } = JSON.parse(fs.readFileSync(path.join(runDir, "command.json"), "utf8"));
+  const stdin = fs.openSync(path.join(runDir, "prompt.txt"), "r");
+  const stdout = fs.openSync(path.join(runDir, "events.jsonl"), "w");
+  const stderr = fs.openSync(path.join(runDir, "stderr.txt"), "w");
+
+  const child = spawn("codex", args, { stdio: [stdin, stdout, stderr], windowsHide: true });
+
+  const finish = (code) => {
+    const tmp = path.join(runDir, "exit.tmp");
+    fs.writeFileSync(tmp, String(code));
+    fs.renameSync(tmp, path.join(runDir, "exit"));
+    process.exit(0);
+  };
+  child.on("exit", (code, signal) => finish(signal ? 1 : (code ?? 1)));
+  child.on("error", (err) => {
+    fs.appendFileSync(path.join(runDir, "stderr.txt"), `\nfailed to launch codex: ${err.message}\n`);
+    finish(127);
+  });
+}
+
+// ------------------------------------------------------------------- wait ---
+function threadId(runDir) {
+  const events = read(path.join(runDir, "events.jsonl"));
+  if (events) {
+    const m = events.match(/"thread_id"\s*:\s*"([^"]+)"/);
+    if (m) return m[1];
+  }
+  return read(path.join(runDir, "resume-id")) || null;
+}
+
+function emitReport(runDir) {
+  const answerPath = path.join(runDir, "answer.md");
+  const exitRaw = read(path.join(runDir, "exit"));
+  const answer = read(answerPath);
+  const bytes = answer ? Buffer.byteLength(answer) : 0;
+  let meta = {};
+  try { meta = JSON.parse(read(path.join(runDir, "meta.json")) || "{}"); } catch { /* ignore */ }
+
+  out("=== codex-subagent ===");
+  out(`status:    ${exitRaw !== null ? `finished (exit ${exitRaw})` : "STILL RUNNING"}`);
+  out(`thread_id: ${threadId(runDir) || "unknown"}`);
+  out(`run_dir:   ${runDir}`);
+  if (meta.mode) out(`mode:      ${meta.mode}`);
+  if (meta.sandbox) out(`sandbox:   ${meta.sandbox} (network=${meta.network})`);
+  if (meta.model) out(`model:     ${meta.model}`);
+  if (meta.workdir) out(`workdir:   ${meta.workdir}`);
+  out(`answer:    ${answerPath} (${bytes} bytes)`);
+
+  if (exitRaw !== null && exitRaw !== "0") {
+    out("\n--- stderr (tail) ---");
+    out((read(path.join(runDir, "stderr.txt")) || "").split("\n").slice(-20).join("\n"));
+  }
+  if (bytes > 0) {
+    out("");
+    if (bytes <= 30000) {
+      out("--- answer ---");
+      out(answer);
+    } else {
+      out(`--- answer (truncated, ${bytes} bytes; Read the full file at the path above) ---`);
+      out(answer.slice(0, 8000) + "\n[...truncated...]");
+    }
+  }
+}
+
+// Distinguishes "still working" from "died without ever writing a marker",
+// which otherwise looks identical and loops forever.
+function runAlive(runDir) {
+  const pid = read(path.join(runDir, "pid"));
+  if (!pid) return false;
+  try { process.kill(Number(pid), 0); return true; } catch { return false; }
+}
+
+async function cmdWait(argv) {
+  const runDir = argv[0];
+  if (!runDir || argv[0]?.startsWith("-")) die("wait: needs a run directory");
+  const o = parseOptions(argv.slice(1), { "--timeout-sec": "value" });
+  const timeout = o["--timeout-sec"] === undefined ? 540 : Number(o["--timeout-sec"]);
+  if (!exists(runDir)) die(`wait: run dir not found: ${runDir}`);
+  if (!Number.isInteger(timeout) || timeout < 0) {
+    die(`--timeout-sec must be a non-negative integer, got: ${o["--timeout-sec"]}`);
+  }
+
+  const exitFile = path.join(runDir, "exit");
+  const deadline = Date.now() + timeout * 1000;
+  while (!exists(exitFile) && Date.now() < deadline) {
+    await sleep(Math.min(500, Math.max(0, deadline - Date.now())));
+    if (!exists(exitFile) && !runAlive(runDir)) {
+      await sleep(1000); // let a just-finished supervisor land its marker
+      if (!exists(exitFile)) {
+        emitReport(runDir);
+        out(`\nRUN DIED without writing a completion marker. Check ${path.join(runDir, "stderr.txt")}`);
+        return EX_DIED;
+      }
+    }
+  }
+
+  emitReport(runDir);
+
+  if (!exists(exitFile)) {
+    out(`\nNOT FINISHED after ${timeout}s. Codex is still running (detached).`);
+    out(`Call again: codex-subagent wait ${JSON.stringify(runDir)}`);
+    return EX_UNFINISHED;
+  }
+  const code = Number(read(exitFile));
+  return Number.isInteger(code) ? code : EX_DIED;
+}
+
+// ---------------------------------------------------------------- install ---
+function ownsTarget() {
+  const body = read(agentTarget());
+  return body !== null && body.includes(MARKER);
+}
+function targetSource() {
+  const body = read(agentTarget()) || "";
+  const m = body.match(new RegExp(`<!-- ${MARKER} from (.*) -->`));
+  return m ? m[1] : null;
+}
+
+function cmdCheck() {
+  let failed = 0;
+  out("Prerequisites:");
+  const codex = onPath("codex");
+  if (codex) ok(`codex CLI: ${codex}`); else { bad("codex CLI not on PATH. Install: npm install -g @openai/codex"); failed = 1; }
+  if (exists(path.join(codexHome(), "auth.json"))) ok("codex appears authenticated");
+  else warn("no codex auth found; run 'codex' once to sign in");
+  if (onPath("claude")) ok("Claude Code found"); else warn("claude not on PATH; install Claude Code to use the agent");
+  if (exists(AGENT_SOURCE)) ok("agent template present"); else { bad(`agent template missing: ${AGENT_SOURCE}`); failed = 1; }
+  return failed;
+}
+
+function cmdStatus() {
+  out("Agent:");
+  const target = agentTarget();
+  if (!exists(target)) {
+    warn(`not installed (${target})`);
+  } else if (ownsTarget()) {
+    ok(`installed at ${target}`);
+    const src = targetSource();
+    if (src) {
+      if (src === ROOT) ok("installed from this copy");
+      else warn(`installed from a DIFFERENT copy: ${src}`);
+      const launcher = path.join(src, "bin", "codex-subagent");
+      if (exists(launcher)) ok("launcher it points at still exists");
+      else {
+        bad(`launcher is GONE: ${launcher} (was it moved, deleted, or upgraded?)`);
+        out("        fix: run `codex-subagent install` again");
+      }
+    }
+  } else {
+    warn(`a codex.md exists but this installer did not create it: ${target}`);
+    out("        install/uninstall will not touch it without --force");
+  }
+
+  out("Runs:");
+  const dir = runsDir();
+  if (!exists(dir)) { ok("no run directories yet"); return EX_OK; }
+  const entries = fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory());
+  ok(`${entries.length} run director${entries.length === 1 ? "y" : "ies"} in ${dir}`);
+  return EX_OK;
+}
+
+function cmdInstall(argv) {
+  const force = argv.includes("--force");
+  for (const a of argv) if (a !== "--force") die(`unknown option: ${a}`);
+
+  const failed = cmdCheck();
+  if (failed) { out(""); warn("prerequisites above failed; installing anyway, but fix them before first use"); }
+  out("");
+
+  const target = agentTarget();
+  const template = read(AGENT_SOURCE);
+  if (template === null) die(`missing ${AGENT_SOURCE}`);
+
+  let stat = null;
+  try { stat = fs.lstatSync(target); } catch { /* absent */ }
+  if (stat && !stat.isSymbolicLink() && !ownsTarget()) {
+    if (!force) {
+      die(`${target} exists and was not created by this installer.\n     Re-run with --force to back it up and replace it.`);
+    }
+    const backup = `${target}.bak.${new Date().toISOString().replace(/[-:T.]/g, "").slice(0, 14)}`;
+    fs.copyFileSync(target, backup);
+    warn(`backed up existing agent to ${backup}`);
+  }
+  if (stat && stat.isSymbolicLink()) fs.unlinkSync(target); // early versions symlinked
+
+  let body = template.split(PLUGIN_ROOT_TOKEN).join(ROOT);
+  if (body.includes("CLAUDE_PLUGIN_ROOT")) die("unsubstituted plugin-root reference remains in rendered agent");
+  body += `\n<!-- ${MARKER} from ${ROOT} -->\n`;
+
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = `${target}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, body);
+  fs.renameSync(tmp, target);
+  out(`Installed ${target}`);
+  out("\nRestart Claude Code so the agent registry picks it up.");
+  out('Then dispatch it with:  Agent(subagent_type: "codex", prompt: "...")');
+  return EX_OK;
+}
+
+function cmdUninstall(argv) {
+  const force = argv.includes("--force");
+  const target = agentTarget();
+  let stat = null;
+  try { stat = fs.lstatSync(target); } catch { /* absent */ }
+  if (!stat) { out("Agent not installed, nothing to remove."); return EX_OK; }
+  if (!stat.isSymbolicLink() && !ownsTarget() && !force) {
+    die(`${target} was not created by this installer. Re-run with --force to remove it anyway.`);
+  }
+  fs.rmSync(target, { force: true });
+  out(`Removed ${target}`);
+  return EX_OK;
+}
+
+function cmdPurge(argv) {
+  const rc = cmdUninstall(argv);
+  if (rc !== EX_OK) return rc;
+  const dir = runsDir();
+  if (!exists(dir)) { out("No run directories to remove."); return EX_OK; }
+  const n = fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).length;
+  fs.rmSync(dir, { recursive: true, force: true });
+  out(`Removed ${n} run director${n === 1 ? "y" : "ies"} from ${dir}`);
+  return EX_OK;
+}
+
+// ------------------------------------------------------------------- main ---
+const [sub, ...rest] = process.argv.slice(2);
+
+if (!sub || sub === "-h" || sub === "--help") {
+  out(USAGE);
+  process.exit(sub ? EX_OK : EX_USAGE);
+}
+
+switch (sub) {
+  case "__supervise": cmdSupervise(rest); break; // never returns
+  case "start":     out(await startRun(rest)); process.exit(EX_OK); break;
+  case "wait":      process.exit(await cmdWait(rest)); break;
+  case "run":       process.exit(await cmdWait([await startRun(rest)])); break;
+  case "install":   process.exit(cmdInstall(rest)); break;
+  case "uninstall": process.exit(cmdUninstall(rest)); break;
+  case "purge":     process.exit(cmdPurge(rest)); break;
+  case "status":    process.exit(cmdStatus()); break;
+  case "check":     process.exit(cmdCheck()); break;
+  default: die(`unknown subcommand: ${sub}`);
+}

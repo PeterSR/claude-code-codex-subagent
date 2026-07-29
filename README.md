@@ -35,20 +35,19 @@ quick human-driven ask. This adds a second lane beside it.
 
 ## Requirements
 
-This package is a Bash launcher plus an agent definition. It bundles no runtime,
-and **npm installs none of the following**. They must already be present:
+This package has no npm dependencies and bundles no runtime. It needs Node 18+,
+which npm already implies, plus two things **npm does not install**:
 
 | Needed | Why | Get it |
 | --- | --- | --- |
 | [Claude Code](https://claude.com/claude-code) | the host the agent runs in | see link |
 | [Codex CLI](https://github.com/openai/codex), authenticated | does the actual work | `npm install -g @openai/codex`, then run `codex` once to sign in |
-| `setsid` | detaches runs so they survive the agent's turn ending | util-linux; preinstalled on Linux, `brew install util-linux` on macOS |
-| Bash 3.2 or newer | the launcher and installer are Bash | preinstalled |
 
 `npm install` prints which of these are present or missing, and
 `codex-subagent check` re-runs that report at any time.
 
-Developed against `codex-cli 0.145.0` and Claude Code 2.1.220 on Linux.
+Linux, macOS, and Windows. Developed against `codex-cli 0.145.0` and Claude Code
+2.1.220 on Linux; CI covers all three platforms on Node 18, 20, and 22.
 
 ## Install
 
@@ -73,9 +72,9 @@ To update: `npm update -g claude-code-codex-subagent`, then
 
 To remove entirely: `codex-subagent purge && npm uninstall -g claude-code-codex-subagent`.
 
-From a clone instead, `./install.sh` takes the same flags with `--` prefixes
-(`./install.sh --status`). Paths are baked in at install time, so re-run it if
-you move or rename the checkout. `status` detects that case and says so rather
+From a clone instead, use `node bin/codex-subagent install`. Paths are baked in
+at install time, so re-run it if you move the checkout, or after an npm upgrade
+changes the package directory. `status` detects that case and says so rather
 than leaving you with an agent that fails mysteriously.
 
 The installer marks the file it generates, so it will not clobber or delete a
@@ -123,20 +122,18 @@ exists because of an observed failure.
 The launcher is a standalone Bash script and needs no Claude Code at all.
 
 ```bash
-bin/codex-subagent run --workdir /repo --sandbox read-only --model gpt-5.6-sol <<'EOF'
-your prompt
-EOF
+codex-subagent run --workdir /repo --sandbox read-only --model gpt-5.6-sol \
+  --prompt-file ./task.txt
 ```
 
 Or split it, which is what the agent does:
 
 ```bash
-RD=$(bin/codex-subagent start --workdir /repo --sandbox read-only <<'EOF'
-your prompt
-EOF
-)
-bin/codex-subagent wait "$RD" --timeout-sec 540   # exit 75 means call again
+RD=$(codex-subagent start --workdir /repo --sandbox read-only --prompt-file ./task.txt)
+codex-subagent wait "$RD" --timeout-sec 540   # exit 75 means call again
 ```
+
+The prompt can also come on stdin instead of `--prompt-file`.
 
 Options for `start` and `run`: `--sandbox`, `--no-network`, `--model`,
 `--effort`, `--workdir`, `--resume <thread-id>`, `--schema <file>`,
@@ -149,9 +146,9 @@ exits 0, 1, or 2 in practice, so the passthrough does not collide with the
 wrapper's own codes today, but it is a passthrough and not a namespace.
 
 Run artifacts land in `~/.cache/codex-subagent/<timestamp>-<pid>/` as
-`prompt.txt`, `command.txt`, `meta.txt`, `events.jsonl`, `stderr.txt`,
+`prompt.txt`, `command.json`, `meta.json`, `events.jsonl`, `stderr.txt`,
 `answer.md`, `pid`, `exit`, plus `resume-id` when resuming. Nothing is cleaned
-up automatically; `./install.sh --purge` removes them all.
+up automatically; `codex-subagent purge` removes them all.
 
 ## How it works
 
@@ -160,8 +157,8 @@ that shells out to `codex exec`. Two design decisions carry the whole thing.
 
 **Runs are detached, not backgrounded.** A subagent's background Bash child is
 killed when its turn ends. That was the first implementation and it lost a Codex
-run mid-flight with no output. Instead `start` launches Codex under `setsid`, in
-its own session, and returns a run directory immediately. The agent then blocks
+run mid-flight with no output. Instead `start` spawns a detached supervisor that
+owns the Codex process, and returns a run directory immediately. The agent then blocks
 in foreground `wait` calls, each under the Bash tool's 600000 ms cap, re-entering
 as often as needed. A useful side effect: the work is no longer coupled to the
 agent's lifetime, so an agent that dies or is interrupted leaves a recoverable
@@ -193,8 +190,6 @@ work at the harness level, and what the official Codex plugin can and cannot do.
   a resumed thread writes wherever the thread was born, not your current
   directory.
 - **No cleanup.** Run directories accumulate under `~/.cache/codex-subagent/`.
-- **macOS needs setsid.** Not present by default. `brew install util-linux`, or
-  substitute another detach mechanism.
 - **Agent changes need a restart.** The registry loads at session start, so
   editing the installed agent mid-session has no effect. Testing tip:
   `claude -p --allowedTools "Agent,Bash,Read" "Dispatch the codex subagent ..."`

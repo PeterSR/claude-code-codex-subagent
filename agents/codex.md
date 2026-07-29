@@ -2,7 +2,7 @@
 name: codex
 description: Delegate a substantial coding, research, diagnosis, or review task to OpenAI Codex running in a sandbox. Use for a genuinely independent second implementation or investigation pass, for work large enough to run for many minutes on its own, or whenever the user asks for Codex. Codex model, reasoning effort, and sandbox policy can be requested in plain prose in the prompt. Do not use for small edits the main thread can finish quickly itself.
 model: sonnet
-tools: Bash, Read
+tools: Bash, Read, Write
 permissionMode: auto
 maxTurns: 40
 color: green
@@ -26,9 +26,10 @@ Bundled schemas live in `${CLAUDE_PLUGIN_ROOT}/schemas`.
 killed when its turn ends. This was tested: the Codex run died mid-flight with
 no answer written. Everything below uses foreground Bash calls.
 
-1. Compose the Codex prompt (see below).
-2. `start` the run. This detaches Codex with `setsid` and returns a run
-   directory immediately, so it survives independently of your turns.
+1. Compose the Codex prompt (see below) and `Write` it to a file.
+2. `start` the run with `--prompt-file`. Codex is launched detached, and the
+   command returns a run directory immediately, so the run survives
+   independently of your turns.
 3. `wait` on that run directory. Each `wait` blocks up to 9 minutes, which stays
    under the Bash tool's 600000 ms cap.
 4. If `wait` exits 75 with `NOT FINISHED`, call `wait` again on the same run
@@ -41,14 +42,15 @@ Exit codes: `0` success, `64` usage error, `70` the run died without writing a
 completion marker (report this, do not retry blindly), `75` not finished yet,
 anything else is Codex's own exit code.
 
-Step 2, prompt on stdin via a quoted heredoc so nothing gets mangled:
+Steps 1 and 2. `Write` the composed prompt to a file, then pass its path. Never
+inline the prompt into the command line: a file avoids every quoting and
+escaping hazard, and works in any shell.
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/bin/codex-subagent" start \
   --workdir /abs/path/to/repo \
-  --sandbox workspace-write <<'CODEX_PROMPT'
-...composed prompt here...
-CODEX_PROMPT
+  --sandbox workspace-write \
+  --prompt-file /tmp/codex-prompt-<something-unique>.txt
 ```
 
 Step 3, with the Bash tool `timeout` set to `570000`:
@@ -94,16 +96,15 @@ file, line, detail, and failure scenario, plus open questions.
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/bin/codex-subagent" start --workdir /repo --sandbox read-only \
-  --schema "${CLAUDE_PLUGIN_ROOT}/schemas/findings.schema.json" <<'CODEX_PROMPT'
-...
-CODEX_PROMPT
+  --schema "${CLAUDE_PLUGIN_ROOT}/schemas/findings.schema.json" \
+  --prompt-file /tmp/codex-prompt-<something-unique>.txt
 ```
 
 Return the JSON as-is. Do not reformat it into prose. The caller asked for
 structure because something downstream will parse it.
 
-For a shape no bundled schema covers, write one to a temp file first and pass
-its path. Every property must be listed in `required` and every object needs
+For a shape no bundled schema covers, `Write` one to a temp file and pass its
+path. Every property must be listed in `required` and every object needs
 `additionalProperties: false`, or Codex rejects the schema.
 
 ## Composing the prompt

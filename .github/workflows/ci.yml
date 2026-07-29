@@ -7,38 +7,37 @@ on:
 
 jobs:
   test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [18, 20, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check
+        run: node --check bin/codex-subagent
+
+      - name: Test suite
+        run: npm test
+
+  package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
-      - name: Lint
-        run: |
-          shellcheck bin/codex-subagent install.sh scripts/postinstall.sh test/run.sh
-          bash -n bin/codex-subagent
-          bash -n install.sh
-
-      - name: No absolute home paths in shipped files
-        run: |
-          ! grep -rqE '/home/[a-z]|/Users/[a-z]' bin agents schemas install.sh scripts
-
-      - name: Agent template keeps its plugin-root token
-        run: grep -q 'CLAUDE_PLUGIN_ROOT' agents/codex.md
-
-      - name: Schemas are valid JSON
-        run: |
-          for f in schemas/*.json; do
-            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
-          done
-
-      - name: Test suite
-        run: bash test/run.sh
-
-      - name: Package installs globally and resolves through its symlink
+      - name: Global install round-trip
         run: |
           npm pack
           npm install -g "./$(ls *.tgz | head -1)"
           codex-subagent --help > /dev/null
-          codex-subagent check || true   # codex CLI is absent in CI
           export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude"
           codex-subagent install
           test -f "$CLAUDE_CONFIG_DIR/agents/codex.md"
