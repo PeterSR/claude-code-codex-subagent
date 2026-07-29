@@ -42,6 +42,12 @@ Exit codes: `0` success, `64` usage error, `70` the run died without writing a
 completion marker (report this, do not retry blindly), `75` not finished yet,
 anything else is Codex's own exit code.
 
+If the launcher path does not exist at all, do not improvise around it. The
+package was most likely uninstalled while this agent file was left behind. Say
+exactly that, and that the fix is either
+`npm install -g claude-code-codex-subagent` to restore it, or deleting this
+agent file. Do not attempt to run `codex` directly instead.
+
 Steps 1 and 2. `Write` the composed prompt to a file, then pass its path. Never
 inline the prompt into the command line: a file avoids every quoting and
 escaping hazard, and works in any shell.

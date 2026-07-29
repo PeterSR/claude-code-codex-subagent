@@ -53,12 +53,17 @@ Linux, macOS, and Windows. Developed against `codex-cli 0.145.0` and Claude Code
 
 ```bash
 npm install -g claude-code-codex-subagent
-codex-subagent install
 ```
 
-The second step writes `~/.claude/agents/codex.md`, pointing at the installed
-package. **Restart Claude Code afterwards**, since the agent registry is read at
-session start.
+That is the whole install. The package writes `~/.claude/agents/codex.md`
+pointing at itself, and prints which external prerequisites are present.
+**Restart Claude Code afterwards**, since the agent registry is read at session
+start.
+
+It installs the agent automatically only when that is unambiguous. It skips, and
+tells you to run `codex-subagent install` yourself, if you are running under
+`sudo` (your real home would be wrong), if Claude Code is not configured yet, or
+if a `codex.md` you wrote by hand is already there.
 
 ```bash
 codex-subagent status      # what is installed, and does it still work
@@ -67,10 +72,21 @@ codex-subagent uninstall   # remove the agent, keep run directories
 codex-subagent purge       # remove the agent and all run directories
 ```
 
-To update: `npm update -g claude-code-codex-subagent`, then
-`codex-subagent install` again to re-point the agent at the new version.
+To update: `npm update -g claude-code-codex-subagent`. Global packages keep a
+stable directory across versions, so the installed agent keeps working; the
+update re-runs the install step anyway.
 
-To remove entirely: `codex-subagent purge && npm uninstall -g claude-code-codex-subagent`.
+To remove, **in this order**:
+
+```bash
+codex-subagent purge                              # agent + run directories
+npm uninstall -g claude-code-codex-subagent
+```
+
+npm v7 removed uninstall lifecycle scripts, so the package cannot clean up after
+itself. If you uninstall in the other order the agent file is orphaned; it will
+then report that it has lost its launcher and tell you how to fix it, rather
+than failing obscurely.
 
 From a clone instead, use `node bin/codex-subagent install`. Paths are baked in
 at install time, so re-run it if you move the checkout, or after an npm upgrade
