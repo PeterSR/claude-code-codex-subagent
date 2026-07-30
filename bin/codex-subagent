@@ -62,9 +62,12 @@ by default: read the file, or run \`answer\`, when you actually want it.
 
 Exit codes: 0 ok, 64 usage, 70 run died, 75 not finished, else Codex's own.`;
 
+// Thrown rather than exited, so the message is written from one place at the
+// top level where the stream can drain before the process ends. See the note on
+// process.exitCode in main.
+class UsageError extends Error {}
 function die(msg) {
-  process.stderr.write(`codex-subagent: ${msg}\n`);
-  process.exit(EX_USAGE);
+  throw new UsageError(msg);
 }
 
 const out = (s) => process.stdout.write(s + "\n");
@@ -684,6 +687,7 @@ async function cmdPurge(argv) {
       process.stdin.setEncoding("utf8");
       process.stdin.once("data", (d) => resolve(String(d).trim().toLowerCase()));
     });
+    process.stdin.pause();   // a still-flowing stdin would keep the loop alive
     if (answer !== "y" && answer !== "yes") { out("Aborted, nothing was deleted."); return EX_OK; }
   }
 
@@ -746,28 +750,43 @@ function splitRunArgs(argv) {
   return { startArgs, waitArgs };
 }
 
-const [sub, ...rest] = process.argv.slice(2);
-
-if (!sub || sub === "-h" || sub === "--help") {
-  out(USAGE);
-  process.exit(sub ? EX_OK : EX_USAGE);
+// Returns the exit code, or null when the subcommand owns the process from here.
+async function main(sub, rest) {
+  if (!sub || sub === "-h" || sub === "--help") {
+    out(USAGE);
+    return sub ? EX_OK : EX_USAGE;
+  }
+  switch (sub) {
+    case "__supervise": cmdSupervise(rest); return null;
+    case "start":     out(await startRun(rest)); return EX_OK;
+    case "wait":      return await cmdWait(rest);
+    case "answer":    return cmdAnswer(rest);
+    case "run": {
+      const { startArgs, waitArgs } = splitRunArgs(rest);
+      return await cmdWait([await startRun(startArgs), ...waitArgs]);
+    }
+    case "install":   return cmdInstall(rest);
+    case "uninstall": return cmdUninstall(rest);
+    case "purge":     return await cmdPurge(rest);
+    case "stop":      return cmdStop(rest);
+    case "status":    return cmdStatus();
+    case "check":     return cmdCheck();
+    default: return die(`unknown subcommand: ${sub}`);
+  }
 }
 
-switch (sub) {
-  case "__supervise": cmdSupervise(rest); break; // never returns
-  case "start":     out(await startRun(rest)); process.exit(EX_OK); break;
-  case "wait":      process.exit(await cmdWait(rest)); break;
-  case "answer":    process.exit(cmdAnswer(rest)); break;
-  case "run": {
-    const { startArgs, waitArgs } = splitRunArgs(rest);
-    process.exit(await cmdWait([await startRun(startArgs), ...waitArgs]));
-    break;
-  }
-  case "install":   process.exit(cmdInstall(rest)); break;
-  case "uninstall": process.exit(cmdUninstall(rest)); break;
-  case "purge":     process.exit(await cmdPurge(rest)); break;
-  case "stop":      process.exit(cmdStop(rest)); break;
-  case "status":    process.exit(cmdStatus()); break;
-  case "check":     process.exit(cmdCheck()); break;
-  default: die(`unknown subcommand: ${sub}`);
+const [sub, ...rest] = process.argv.slice(2);
+
+// Deliberately not process.exit(). Node's stdout is asynchronous when it is a
+// pipe on macOS, which is exactly what it is under Claude Code's Bash tool, so
+// exiting outright discards whatever is still buffered. That silently truncated
+// long answers on macOS while passing everywhere else. Setting the code instead
+// lets the stream drain and the process end on its own.
+try {
+  const code = await main(sub, rest);
+  if (code !== null) process.exitCode = code;
+} catch (err) {
+  if (!(err instanceof UsageError)) throw err;
+  process.stderr.write(`codex-subagent: ${err.message}\n`);
+  process.exitCode = EX_USAGE;
 }

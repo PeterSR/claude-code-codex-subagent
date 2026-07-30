@@ -137,6 +137,11 @@ test("run state machine", async (t) => {
 // `wait` prints. An answer inlined here is billed to Claude roughly three times
 // for work that was meant to run on Codex's side, so the default has to stay
 // bounded no matter how much Codex wrote.
+//
+// The 50 kB payload below is load-bearing, not arbitrary. Node's stdout is
+// asynchronous when it is a pipe on macOS, so a payload large enough to still
+// be buffered at exit caught a truncation bug that every other platform hid.
+// Shrinking it would drop that coverage silently.
 test("answer output policy", async (t) => {
   const BIG = "x".repeat(50_000);
 
