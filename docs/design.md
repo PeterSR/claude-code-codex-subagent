@@ -84,17 +84,72 @@ than Sonnet's, and receives no signal that they got a substitute.
 without a Codex run is a failure regardless of whether the reply was correct.
 The only thing returnable without a run is a failure report.
 
-## Guardrails are injected into every prompt
+## The answer is a file path, not a message
 
-Four blocks are appended to every dispatch: keep changes scoped and do not run
+**Constraint:** the wrapper is a Claude instance, so anything `wait` prints is
+billed to Anthropic, and so is anything the wrapper then relays.
+
+The first implementation inlined the whole answer whenever it was under 30 kB.
+That put a single Codex answer through Claude's meter three times: once as a
+tool result in the wrapper's context, once as output tokens when the wrapper
+repeated it verbatim, and once more when the harness inlined the wrapper's final
+message into its caller's `<result>` block. A 15 kB answer is roughly 11k Claude
+tokens spent relaying work that had already been paid for on OpenAI's side.
+
+Delegating to Codex is supposed to move reasoning off Claude. It cannot also
+move the observation off Claude if the answer is copied back through two Claude
+contexts to get there.
+
+**Design:** `codex exec -o` already writes the answer to `answer.md`. `wait`
+reports the path, the size, and a bounded preview (1200 bytes by default), and
+the wrapper returns that as a receipt. Whoever dispatched the agent reads the
+file if and only if they want the prose, which is one billed copy instead of
+three, and none at all when the caller only needed the work done.
+
+This mirrors how the harness treats subagents generally: the parent is given the
+final message and a transcript path, never the transcript.
+
+`--answer full` is the opt-in for callers who really do want it inline, and
+`--answer none` suppresses even the preview. The preview exists because it is
+cheap and it carries Codex's own lead paragraph, which the `<reporting>`
+guardrail asks it to make a summary. That is usually enough to decide whether
+the file is worth opening.
+
+## Guardrails are injected by the launcher, not the prompt
+
+Five blocks are appended to every dispatch: keep changes scoped and do not run
 repo-wide formatters; do not invent APIs, stop and report a blocker instead;
 emit a complete diff if the sandbox turns out read-only; verify before
-finalising.
+finalising; and lead the answer with a summary that names any deliberate
+deviation.
 
 Each corresponds to an observed failure, including a run that reformatted nine
 unrelated migration files, and a reported test pass on a run where the patch had
-never been applied. They are on by default because the failures they prevent are
-things one knows but does not repeat on every dispatch.
+never been applied. Asking explicitly for deviations was observed to license
+sensible ones, such as renaming a symbol the language would not allow, rather
+than producing silent divergence or a stuck run.
+
+They live in the launcher rather than in the agent's instructions for two
+reasons. They are then guaranteed instead of retyped, and the wrapper does not
+spend output tokens reproducing forty lines of boilerplate on every dispatch.
+`--no-guardrails` opts out.
+
+## The wait summary reports the blast radius
+
+**Constraint:** the caller's first question after a write run is which files
+moved, and the honest answer cannot come from Codex, whose self-reports have
+been observed to be wrong.
+
+**Design:** `start` records `git status --porcelain` and `HEAD` for the working
+root; `wait` takes the same reading afterwards and reports the difference. It is
+observed rather than claimed, it costs the wrapper no extra tool call, and it
+gives a caller who never opens `answer.md` the one fact it most needs. When
+Codex commits, the paths come from the commit range instead of the worktree, so
+committed work is not reported as an empty diff.
+
+Skipped when the working root is not known: a resumed thread is pinned to
+wherever it was born, so without an explicit `--workdir` a snapshot of the
+current directory would describe the wrong repository.
 
 ## Safety choices in the installer
 

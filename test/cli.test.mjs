@@ -133,6 +133,88 @@ test("run state machine", async (t) => {
   });
 });
 
+// The wrapper agent's Claude context, and then its caller's, pay for anything
+// `wait` prints. An answer inlined here is billed to Claude roughly three times
+// for work that was meant to run on Codex's side, so the default has to stay
+// bounded no matter how much Codex wrote.
+test("answer output policy", async (t) => {
+  const BIG = "x".repeat(50_000);
+
+  await t.test("a large answer is previewed, not dumped", () => {
+    const dir = mkRun("big", { exit: "0", "answer.md": BIG });
+    const r = cli(["wait", dir, "--timeout-sec", "1"]);
+    assert.equal(r.code, 0);
+    assert.ok(r.out.length < 4000, `wait emitted ${r.out.length} bytes for a 50 kB answer`);
+    assert.match(r.out, /first 1200 of 50000 bytes/);
+    assert.match(r.out, /answer\.md/, "the path to the full answer must survive");
+  });
+
+  await t.test("the preview never cuts a line in half", () => {
+    const body = Array.from({ length: 500 }, (_, i) => `line ${i} ${"y".repeat(40)}`).join("\n");
+    const dir = mkRun("lines", { exit: "0", "answer.md": body });
+    const r = cli(["wait", dir, "--timeout-sec", "1"]);
+    const preview = r.out.split(/--- answer, first \d+ of \d+ bytes ---\n/)[1].split("\n[...truncated")[0];
+    const whole = new Set(body.split("\n"));
+    for (const line of preview.split("\n")) assert.ok(whole.has(line), `partial line: ${line}`);
+  });
+
+  await t.test("an answer smaller than the preview budget is shown whole", () => {
+    const dir = mkRun("small", { exit: "0", "answer.md": "short and complete\n" });
+    const r = cli(["wait", dir, "--timeout-sec", "1"]);
+    assert.match(r.out, /--- answer ---/);
+    assert.ok(!r.out.includes("truncated"), "a whole answer must not claim truncation");
+  });
+
+  await t.test("--answer none prints no answer body at all", () => {
+    const dir = mkRun("quiet", { exit: "0", "answer.md": BIG });
+    const r = cli(["wait", dir, "--timeout-sec", "1", "--answer", "none"]);
+    assert.equal(r.code, 0);
+    assert.ok(!r.out.includes("--- answer"), "answer body leaked with --answer none");
+    assert.match(r.out, /\(50000 bytes\)/, "the size must still be reported");
+  });
+
+  await t.test("--answer full is the opt-in that inlines everything", () => {
+    const dir = mkRun("loud", { exit: "0", "answer.md": BIG });
+    const r = cli(["wait", dir, "--timeout-sec", "1", "--answer", "full"]);
+    assert.ok(r.out.includes(BIG), "--answer full did not emit the whole answer");
+  });
+
+  await t.test("--preview-bytes resizes the preview", () => {
+    const dir = mkRun("sized", { exit: "0", "answer.md": BIG });
+    assert.match(cli(["wait", dir, "--timeout-sec", "1", "--preview-bytes", "100"]).out,
+                 /first 100 of 50000 bytes/);
+  });
+
+  await t.test("the preview budget is bytes, not characters", () => {
+    const dir = mkRun("utf8", { exit: "0", "answer.md": "€".repeat(5000) });
+    const r = cli(["wait", dir, "--timeout-sec", "1", "--preview-bytes", "200"]);
+    const preview = r.out.split(/--- answer, first \d+ of \d+ bytes ---\n/)[1].split("\n[...truncated")[0];
+    assert.ok(Buffer.byteLength(preview) <= 200,
+              `3-byte characters overshot the budget: ${Buffer.byteLength(preview)} bytes`);
+    assert.ok(!preview.includes("�"), "the cut landed mid-codepoint and left a replacement char");
+  });
+
+  await t.test("an invalid answer mode is rejected", () => {
+    const dir = mkRun("badmode", { exit: "0", "answer.md": "x" });
+    const r = cli(["wait", dir, "--timeout-sec", "1", "--answer", "everything"]);
+    assert.equal(r.code, 64);
+    assert.match(r.out, /--answer must be none, preview, or full/);
+  });
+
+  await t.test("the answer subcommand prints the whole file", () => {
+    const dir = mkRun("fetch", { exit: "0", "answer.md": BIG });
+    const r = cli(["answer", dir]);
+    assert.equal(r.code, 0);
+    assert.equal(r.out, BIG);
+  });
+
+  await t.test("asking for an answer before the run finishes fails clearly", () => {
+    const r = cli(["answer", mkRun("pending", { pid: String(process.pid) })]);
+    assert.equal(r.code, 64);
+    assert.match(r.out, /has not finished/);
+  });
+});
+
 test("install lifecycle", async (t) => {
   await t.test("install writes the agent with paths substituted", () => {
     assert.equal(cli(["install"]).code, 0);
@@ -229,6 +311,35 @@ if (outIdx !== -1) fs.writeFileSync(args[outIdx + 1], "STUB ANSWER");
 process.exit(0);
 `;
 
+// Same, but edits the working root so the blast-radius report has something to
+// find: one new untracked file and one modification to a tracked file.
+const STUB_WRITES = `
+import fs from "node:fs";
+import path from "node:path";
+const args = process.argv.slice(2);
+const cd = args[args.indexOf("-C") + 1];
+fs.writeFileSync(path.join(cd, "new-file.txt"), "made by codex\\n");
+fs.appendFileSync(path.join(cd, "tracked.txt"), "changed\\n");
+const outIdx = args.findIndex((a) => a === "-o");
+if (outIdx !== -1) fs.writeFileSync(args[outIdx + 1], "STUB ANSWER");
+process.exit(0);
+`;
+
+const hasGit = () => spawnSync("git", ["--version"]).status === 0;
+
+function gitRepo(name) {
+  const dir = path.join(TMP, name);
+  fs.mkdirSync(dir, { recursive: true });
+  const g = (...a) => spawnSync("git", a, { cwd: dir, stdio: "ignore" });
+  g("init", "-q");
+  g("config", "user.email", "test@example.invalid");
+  g("config", "user.name", "test");
+  fs.writeFileSync(path.join(dir, "tracked.txt"), "original\n");
+  g("add", ".");
+  g("commit", "-qm", "init");
+  return dir;
+}
+
 test("end to end with a stub codex", async (t) => {
   await t.test("start, supervise, and wait complete a real run", async () => {
     const bin = stubCodex(STUB_OK);
@@ -253,7 +364,9 @@ test("end to end with a stub codex", async (t) => {
     const runDir = started.out.trim().split("\n").pop();
     cli(["wait", runDir, "--timeout-sec", "20"], { env });
 
-    assert.equal(fs.readFileSync(path.join(runDir, "prompt.txt"), "utf8"), "remember this prompt");
+    const recorded = fs.readFileSync(path.join(runDir, "prompt.txt"), "utf8");
+    assert.match(recorded, /^remember this prompt\n/);
+    assert.match(recorded, /<action_safety>/, "guardrails not appended");
     const { cmd, args } = JSON.parse(fs.readFileSync(path.join(runDir, "command.json"), "utf8"));
     assert.ok(cmd.includes("codex"), `resolved command looks wrong: ${cmd}`);
     assert.deepEqual(args.slice(0, 4), ["exec", "-s", "read-only", "-C"]);
@@ -272,6 +385,74 @@ test("end to end with a stub codex", async (t) => {
     assert.deepEqual(args.slice(0, 5), ["exec", "resume", "thread-xyz", "-c", "sandbox_mode=workspace-write"]);
     assert.ok(!args.includes("-C"), "resume must not pass a working directory");
     assert.ok(args.includes("sandbox_workspace_write.network_access=true"), "network default lost");
+  });
+
+  await t.test("guardrails are appended by the launcher, not the caller", () => {
+    const bin = stubCodex(STUB_OK);
+    const env = { PATH: bin + path.delimiter + process.env.PATH };
+    const started = cli(["start", "--workdir", TMP, "--sandbox", "read-only"], { stdin: "task text", env });
+    const runDir = started.out.trim().split("\n").pop();
+    const recorded = fs.readFileSync(path.join(runDir, "prompt.txt"), "utf8");
+    for (const block of ["action_safety", "missing_context_gating", "sandbox_fallback",
+                         "verification_loop", "reporting"]) {
+      assert.match(recorded, new RegExp(`<${block}>`), `${block} guardrail missing`);
+    }
+  });
+
+  await t.test("--no-guardrails leaves the prompt exactly as given", () => {
+    const bin = stubCodex(STUB_OK);
+    const env = { PATH: bin + path.delimiter + process.env.PATH };
+    const started = cli(["start", "--workdir", TMP, "--sandbox", "read-only", "--no-guardrails"],
+                        { stdin: "task text", env });
+    const runDir = started.out.trim().split("\n").pop();
+    assert.equal(fs.readFileSync(path.join(runDir, "prompt.txt"), "utf8"), "task text");
+  });
+
+  await t.test("run routes wait options through to the wait", () => {
+    const bin = stubCodex(STUB_OK);
+    const env = { PATH: bin + path.delimiter + process.env.PATH };
+    const r = cli(["run", "--workdir", TMP, "--sandbox", "read-only",
+                   "--timeout-sec", "20", "--answer", "none"], { stdin: "x", env });
+    assert.equal(r.code, 0, r.out);
+    assert.ok(!r.out.includes("STUB ANSWER"), "run ignored --answer");
+  });
+
+  await t.test("the summary reports which files the run changed", { skip: !hasGit() }, () => {
+    const repo = gitRepo("blast");
+    const bin = stubCodex(STUB_WRITES);
+    const env = { PATH: bin + path.delimiter + process.env.PATH };
+    const started = cli(["start", "--workdir", repo], { stdin: "write things", env });
+    const runDir = started.out.trim().split("\n").pop();
+    const r = cli(["wait", runDir, "--timeout-sec", "20"], { env });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /changed:\s+2 paths/);
+    assert.match(r.out, /new-file\.txt/);
+    assert.match(r.out, /tracked\.txt/);
+  });
+
+  await t.test("a run that touches nothing says so", { skip: !hasGit() }, () => {
+    const repo = gitRepo("untouched");
+    const bin = stubCodex(STUB_OK);
+    const env = { PATH: bin + path.delimiter + process.env.PATH };
+    const started = cli(["start", "--workdir", repo, "--sandbox", "read-only"], { stdin: "look only", env });
+    const runDir = started.out.trim().split("\n").pop();
+    assert.match(cli(["wait", runDir, "--timeout-sec", "20"], { env }).out, /changed:\s+nothing/);
+  });
+
+  // A run killed halfway may still have edited files, which is exactly when the
+  // caller most needs to know which ones.
+  await t.test("a run that died still reports what it changed", { skip: !hasGit() }, () => {
+    const repo = gitRepo("died");
+    const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).stdout.trim();
+    const dir = mkRun("died-run", {
+      pid: "999999",
+      "git-before.json": JSON.stringify({ root: repo, head, status: "" }),
+    });
+    fs.writeFileSync(path.join(repo, "half-written.ts"), "incomplete\n");
+    const r = cli(["wait", dir, "--timeout-sec", "5"]);
+    assert.equal(r.code, 70);
+    assert.match(r.out, /RUN DIED/);
+    assert.match(r.out, /half-written\.ts/, "a died run hid its blast radius");
   });
 
   await t.test("a nonzero codex exit is surfaced with its stderr", () => {

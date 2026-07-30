@@ -10,7 +10,7 @@
 // Exit codes: 0 success, 64 usage error, 70 run died, 75 not finished yet,
 // otherwise Codex's own exit code.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -27,10 +27,11 @@ const EX_OK = 0, EX_USAGE = 64, EX_DIED = 70, EX_UNFINISHED = 75;
 const USAGE = `codex-subagent
 
 Run:
-  start [options]                    launch detached, print run dir, exit
-  wait <run-dir> [--timeout-sec N]   block until finished or N seconds pass
-  run [options]                      start then wait
-  stop <run-dir>                     terminate a running Codex process
+  start [options]            launch detached, print run dir, exit
+  wait <run-dir> [options]   block until finished or the timeout passes
+  run [options]              start then wait
+  answer <run-dir>           print the full answer to stdout
+  stop <run-dir>             terminate a running Codex process
 
 Manage:
   install [--force]   write the agent into Claude Code
@@ -49,6 +50,15 @@ Options for start/run:
   --schema <file>         JSON Schema for structured final output
   --prompt-file <file>    read the prompt from a file instead of stdin
   --run-dir <dir>         override run directory location (must not be reused)
+  --no-guardrails         do not append the standard guardrail blocks
+
+Options for wait/run:
+  --timeout-sec <n>       seconds to block for; default: 540
+  --answer <none|preview|full>   how much of the answer to print; default: preview
+  --preview-bytes <n>     size of the preview; default: 1200
+
+The answer is always written to <run-dir>/answer.md. It is NOT printed in full
+by default: read the file, or run \`answer\`, when you actually want it.
 
 Exit codes: 0 ok, 64 usage, 70 run died, 75 not finished, else Codex's own.`;
 
@@ -126,12 +136,128 @@ function parseOptions(argv, spec) {
   return opts;
 }
 
+// ------------------------------------------------------------ blast radius ---
+// The first question after a write run is "what did it touch". A git snapshot
+// either side of the run answers that in the wait summary, so the caller does
+// not spend a tool call and a diff dump finding out.
+function git(root, args) {
+  try {
+    const r = spawnSync("git", args, { cwd: root, encoding: "utf8", windowsHide: true });
+    return r.status === 0 ? (r.stdout || "") : null;
+  } catch {
+    return null;
+  }
+}
+
+function gitRoot(dir) {
+  const top = git(dir, ["rev-parse", "--show-toplevel"]);
+  return top ? top.trim() : null;
+}
+
+function gitSnapshot(root) {
+  if (!root) return null;
+  const status = git(root, ["status", "--porcelain=v1", "-uall"]);
+  if (status === null) return null;
+  return { root, head: (git(root, ["rev-parse", "HEAD"]) || "").trim(), status };
+}
+
+// Porcelain v1: two status characters, a space, then the path.
+function parseStatus(text) {
+  const map = new Map();
+  for (const line of (text || "").split("\n")) {
+    if (line.length > 3) map.set(line.slice(3), line.slice(0, 2));
+  }
+  return map;
+}
+
+const MAX_LISTED = 40;
+
+function blastRadius(runDir) {
+  let before = null;
+  try { before = JSON.parse(read(path.join(runDir, "git-before.json")) || "null"); } catch { /* ignore */ }
+  if (!before?.root) return [];
+
+  const after = gitSnapshot(before.root);
+  if (!after) return [`changed:   unknown, ${before.root} could not be re-read with git`];
+
+  const b = parseStatus(before.status);
+  const a = parseStatus(after.status);
+  const entries = new Map();
+  for (const [p, xy] of a) if (b.get(p) !== xy) entries.set(p, xy);
+
+  const moved = before.head && after.head && before.head !== after.head;
+  if (moved) {
+    // Committed work leaves a clean tree, so the worktree delta alone would
+    // report nothing. Take the paths from the commit range instead.
+    for (const line of (git(before.root, ["diff", "--name-status", `${before.head}..${after.head}`]) || "").split("\n")) {
+      if (!line.trim()) continue;
+      const [code, ...rest] = line.split("\t");
+      const p = rest.join(" ");
+      if (p && !entries.has(p)) entries.set(p, code.slice(0, 2).padEnd(2));
+    }
+  } else {
+    for (const p of b.keys()) if (!a.has(p)) entries.set(p, "--");
+  }
+
+  if (!entries.size && !moved) return [`changed:   nothing under ${before.root}`];
+
+  const lines = [`changed:   ${entries.size} path${entries.size === 1 ? "" : "s"} under ${before.root}`];
+  if (moved) {
+    const n = (git(before.root, ["rev-list", "--count", `${before.head}..${after.head}`]) || "?").trim();
+    lines.push(`           HEAD moved ${before.head.slice(0, 8)} -> ${after.head.slice(0, 8)}, ${n} commit(s)`);
+  }
+  let shown = 0;
+  for (const [p, code] of entries) {
+    if (shown++ >= MAX_LISTED) break;
+    lines.push(`           ${code} ${p}`);
+  }
+  if (entries.size > MAX_LISTED) lines.push(`           ... and ${entries.size - MAX_LISTED} more`);
+  return lines;
+}
+
 // ------------------------------------------------------------------ start ---
 const START_SPEC = {
   "--sandbox": "value", "--model": "value", "--effort": "value",
   "--workdir": "value", "--resume": "value", "--schema": "value",
   "--prompt-file": "value", "--run-dir": "value", "--no-network": "flag",
+  "--no-guardrails": "flag",
 };
+
+// Appended to every prompt unless --no-guardrails. Each block corresponds to an
+// observed failure. Keeping them here rather than in the agent instructions
+// means they are guaranteed rather than retyped, and the wrapper does not spend
+// output tokens reproducing them on every dispatch.
+const GUARDRAILS = `
+<action_safety>
+Keep changes tightly scoped to the stated task.
+Do not run formatters or linters across the repository.
+Only touch files the task actually requires.
+</action_safety>
+
+<missing_context_gating>
+Do not guess missing repository facts and do not invent APIs.
+If a hard prerequisite cannot be met, stop and report the blocker rather than
+fabricating a plausible implementation.
+</missing_context_gating>
+
+<sandbox_fallback>
+If the workspace turns out to be read-only and you cannot apply edits, still
+output the COMPLETE unified diff for every file you would have changed, so it
+can be applied by hand.
+</sandbox_fallback>
+
+<verification_loop>
+Before finalizing, verify the result against the task requirements and the
+files you changed. If a check fails, revise rather than reporting the first
+draft.
+</verification_loop>
+
+<reporting>
+Open your final message with a short summary: what you did, what you verified
+and how, and anything in the task you deliberately deviated from and why. Put
+the detail after that. Do not restate the task back.
+</reporting>
+`;
 
 function readStdin() {
   if (process.stdin.isTTY) {
@@ -201,7 +327,16 @@ async function startRun(argv) {
     prompt = readStdin();
   }
   if (!prompt.trim()) die("empty prompt");
+  if (!o["--no-guardrails"]) prompt = `${prompt.trimEnd()}\n${GUARDRAILS}`;
   fs.writeFileSync(promptFile, prompt);
+
+  // Snapshot only when the working root is actually known. A resumed thread is
+  // pinned to wherever it was born, so unless the caller named a directory,
+  // guessing at cwd would report a blast radius for the wrong repository.
+  if (!cfg.resume || o["--workdir"]) {
+    const snapshot = exists(cfg.workdir) ? gitSnapshot(gitRoot(cfg.workdir)) : null;
+    if (snapshot) fs.writeFileSync(path.join(runDir, "git-before.json"), JSON.stringify(snapshot));
+  }
 
   // Probed last, so an argument mistake reports the argument rather than the
   // environment.
@@ -286,7 +421,24 @@ function threadId(runDir) {
   return read(path.join(runDir, "resume-id")) || null;
 }
 
-function emitReport(runDir) {
+// The budget is in bytes, so slice the buffer rather than the string: a string
+// slice of dense multibyte text would overshoot the budget several times over.
+// Cutting back to a line boundary then keeps the preview from ending mid
+// sentence, and drops any replacement character left by a mid-codepoint cut.
+function head(text, budget) {
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= budget) return text;
+  const slice = buf.subarray(0, budget).toString("utf8").replace(/�$/, "");
+  const cut = slice.lastIndexOf("\n");
+  return cut > slice.length / 2 ? slice.slice(0, cut) : slice;
+}
+
+// The answer is deliberately NOT dumped here by default. This output lands in
+// the wrapper agent's Claude context, and whatever the wrapper then relays
+// lands in its caller's context too, so an inlined answer is billed to Claude
+// roughly three times over for work that was supposed to run on Codex's side.
+// The file path is the deliverable; `answerMode: full` is the opt-in.
+function emitReport(runDir, { answerMode = "preview", previewBytes = 1200, ended = null } = {}) {
   const answerPath = path.join(runDir, "answer.md");
   const exitRaw = read(path.join(runDir, "exit"));
   const answer = read(answerPath);
@@ -303,21 +455,22 @@ function emitReport(runDir) {
   if (meta.model) out(`model:     ${meta.model}`);
   if (meta.workdir) out(`workdir:   ${meta.workdir}`);
   out(`answer:    ${answerPath} (${bytes} bytes)`);
+  // Only once the run is over. Mid-run the reading would be a snapshot of work
+  // in progress, and every poll would pay for it again.
+  if (ended ?? exitRaw !== null) for (const line of blastRadius(runDir)) out(line);
 
   if (exitRaw !== null && exitRaw !== "0") {
     out("\n--- stderr (tail) ---");
     out((read(path.join(runDir, "stderr.txt")) || "").split("\n").slice(-20).join("\n"));
   }
-  if (bytes > 0) {
-    out("");
-    if (bytes <= 30000) {
-      out("--- answer ---");
-      out(answer);
-    } else {
-      out(`--- answer (truncated, ${bytes} bytes; Read the full file at the path above) ---`);
-      out(answer.slice(0, 8000) + "\n[...truncated...]");
-    }
-  }
+  if (bytes === 0 || answerMode === "none") return;
+
+  const preview = answerMode === "full" ? answer : head(answer, previewBytes);
+  const partial = preview.length < answer.length;
+  out("");
+  out(partial ? `--- answer, first ${Buffer.byteLength(preview)} of ${bytes} bytes ---` : "--- answer ---");
+  out(preview);
+  if (partial) out(`[...truncated. Read ${answerPath} for the rest, do not re-print it.]`);
 }
 
 // Distinguishes "still working" from "died without ever writing a marker",
@@ -328,15 +481,28 @@ function runAlive(runDir) {
   try { process.kill(Number(pid), 0); return true; } catch { return false; }
 }
 
+const WAIT_SPEC = {
+  "--timeout-sec": "value", "--answer": "value", "--preview-bytes": "value",
+};
+
 async function cmdWait(argv) {
   const runDir = argv[0];
   if (!runDir || argv[0]?.startsWith("-")) die("wait: needs a run directory");
-  const o = parseOptions(argv.slice(1), { "--timeout-sec": "value" });
+  const o = parseOptions(argv.slice(1), WAIT_SPEC);
   const timeout = o["--timeout-sec"] === undefined ? 540 : Number(o["--timeout-sec"]);
+  const answerMode = o["--answer"] === undefined ? "preview" : o["--answer"];
+  const previewBytes = o["--preview-bytes"] === undefined ? 1200 : Number(o["--preview-bytes"]);
   if (!exists(runDir)) die(`wait: run dir not found: ${runDir}`);
   if (!Number.isInteger(timeout) || timeout < 0) {
     die(`--timeout-sec must be a non-negative integer, got: ${o["--timeout-sec"]}`);
   }
+  if (!["none", "preview", "full"].includes(answerMode)) {
+    die(`--answer must be none, preview, or full, got: ${answerMode}`);
+  }
+  if (!Number.isInteger(previewBytes) || previewBytes < 0) {
+    die(`--preview-bytes must be a non-negative integer, got: ${o["--preview-bytes"]}`);
+  }
+  const reportOpts = { answerMode, previewBytes };
 
   const exitFile = path.join(runDir, "exit");
   const deadline = Date.now() + timeout * 1000;
@@ -345,14 +511,16 @@ async function cmdWait(argv) {
     if (!exists(exitFile) && !runAlive(runDir)) {
       await sleep(1000); // let a just-finished supervisor land its marker
       if (!exists(exitFile)) {
-        emitReport(runDir);
+        // A run that died halfway may still have edited files, so this is
+        // exactly when the caller most needs the blast radius.
+        emitReport(runDir, { ...reportOpts, ended: true });
         out(`\nRUN DIED without writing a completion marker. Check ${path.join(runDir, "stderr.txt")}`);
         return EX_DIED;
       }
     }
   }
 
-  emitReport(runDir);
+  emitReport(runDir, reportOpts);
 
   if (!exists(exitFile)) {
     out(`\nNOT FINISHED after ${timeout}s. Codex is still running (detached).`);
@@ -527,6 +695,22 @@ async function cmdPurge(argv) {
   return EX_OK;
 }
 
+// The counterpart to not printing the answer by default: one obvious command
+// that does, for a human or for a caller that has decided it wants the text.
+function cmdAnswer(argv) {
+  const runDir = argv[0];
+  if (!runDir || runDir.startsWith("-")) die("answer: needs a run directory");
+  if (!exists(runDir)) die(`answer: run dir not found: ${runDir}`);
+  const body = read(path.join(runDir, "answer.md"));
+  if (body === null) {
+    die(exists(path.join(runDir, "exit"))
+      ? `answer: the run finished without writing an answer: ${runDir}`
+      : `answer: no answer yet, the run has not finished: ${runDir}`);
+  }
+  process.stdout.write(body);
+  return EX_OK;
+}
+
 function cmdStop(argv) {
   const runDir = argv[0];
   if (!runDir || runDir.startsWith("-")) die("stop: needs a run directory");
@@ -549,6 +733,19 @@ function cmdStop(argv) {
 }
 
 // ------------------------------------------------------------------- main ---
+// `run` is start plus wait, so its argv carries options for both. Split them by
+// which spec owns the flag rather than making the caller order them.
+function splitRunArgs(argv) {
+  const startArgs = [], waitArgs = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!WAIT_SPEC[arg]) { startArgs.push(arg); continue; }
+    waitArgs.push(arg);
+    if (WAIT_SPEC[arg] === "value" && argv[i + 1] !== undefined) waitArgs.push(argv[++i]);
+  }
+  return { startArgs, waitArgs };
+}
+
 const [sub, ...rest] = process.argv.slice(2);
 
 if (!sub || sub === "-h" || sub === "--help") {
@@ -560,7 +757,12 @@ switch (sub) {
   case "__supervise": cmdSupervise(rest); break; // never returns
   case "start":     out(await startRun(rest)); process.exit(EX_OK); break;
   case "wait":      process.exit(await cmdWait(rest)); break;
-  case "run":       process.exit(await cmdWait([await startRun(rest)])); break;
+  case "answer":    process.exit(cmdAnswer(rest)); break;
+  case "run": {
+    const { startArgs, waitArgs } = splitRunArgs(rest);
+    process.exit(await cmdWait([await startRun(startArgs), ...waitArgs]));
+    break;
+  }
   case "install":   process.exit(cmdInstall(rest)); break;
   case "uninstall": process.exit(cmdUninstall(rest)); break;
   case "purge":     process.exit(await cmdPurge(rest)); break;

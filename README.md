@@ -146,8 +146,52 @@ runs overlap.
 
 **Guardrails.** Every dispatch appends blocks telling Codex to keep changes
 scoped, not to run repo-wide formatters, not to invent APIs, to emit a full diff
-if the sandbox turns out read-only, and to verify before finalising. Each one
-exists because of an observed failure.
+if the sandbox turns out read-only, to verify before finalising, and to lead its
+answer with a summary naming any deliberate deviation. Each one exists because of
+an observed failure. `--no-guardrails` turns them off.
+
+**Blast radius.** The launcher takes a `git status` reading either side of the
+run and reports the difference, so you get the list of files Codex actually
+touched without asking Codex, and without spending a tool call on it.
+
+### The answer is handed back as a file, not a wall of text
+
+The wrapper is a Claude instance, so anything it reads and anything it says are
+both billed to Anthropic. Inlining Codex's answer puts it through Claude's meter
+three times: into the wrapper's context, out again as the wrapper repeats it, and
+once more when the harness inlines the wrapper's reply into yours. That is a lot
+of Claude tokens spent relaying work you delegated specifically so it would not
+cost Claude tokens.
+
+So it does not do that. `codex exec` writes the answer to `answer.md`, and the
+agent returns a receipt:
+
+```
+Codex finished, exit 0.
+
+Answer:  ~/.cache/codex-subagent/20260730T1810-3777726/answer.md
+Thread:  01JQ-demo-thread
+Run dir: ~/.cache/codex-subagent/20260730T1810-3777726
+Changed: 2 paths under /repo
+            M src/exporter.ts
+           ?? src/budget.ts
+
+--- answer, first 1200 of 15420 bytes ---
+Implemented the token budget. Verified with npm test, 53 pass. I deviated on
+one point: the spec asked for Status as both a struct and a function, which Go
+forbids, so the struct is LinkStatus.
+[...truncated]
+```
+
+`Read` the file when you want the prose, which is one billed copy instead of
+three, and none at all when you only needed the work done. This is how the
+harness treats subagents generally: you get the final message and a path, not the
+transcript.
+
+Ask for it inline and you get it inline. "Return the full answer" makes the
+wrapper pass `--answer full`. The preview is 1200 bytes by default because
+Codex is told to lead with a summary, which is usually enough to decide whether
+the file is worth opening; `--answer none` drops even that.
 
 ### Using the launcher directly
 
@@ -163,18 +207,20 @@ Or split it, which is what the agent does:
 ```bash
 RD=$(codex-subagent start --workdir /repo --sandbox read-only --prompt-file ./task.txt)
 codex-subagent wait "$RD" --timeout-sec 540   # exit 75 means call again
-codex-subagent stop "$RD"                    # if you want to abandon it
+codex-subagent answer "$RD"                   # the full answer, when you want it
+codex-subagent stop "$RD"                     # if you want to abandon it
 ```
 
-`run` is `start` plus a single `wait` at the default 540 s. For longer jobs use
-`start` and `wait` separately so you can re-enter the wait.
+`run` is `start` plus a single `wait`, and takes the options of both. For jobs
+longer than one wait, use `start` and `wait` separately so you can re-enter the
+wait.
 
 The prompt can also come on stdin instead of `--prompt-file`.
 
 Options for `start` and `run`: `--sandbox`, `--no-network`, `--model`,
 `--effort`, `--workdir`, `--resume <thread-id>`, `--schema <file>`,
-`--prompt-file <file>`, `--run-dir`. `wait` takes a run directory and
-`--timeout-sec`.
+`--prompt-file <file>`, `--run-dir`, `--no-guardrails`. Options for `wait` and
+`run`: `--timeout-sec`, `--answer <none|preview|full>`, `--preview-bytes`.
 
 Exit codes: `0` success, `64` usage error, `70` the run died without writing a
 completion marker, `75` not finished yet, otherwise Codex's own exit code. Codex
@@ -183,8 +229,12 @@ wrapper's own codes today, but it is a passthrough and not a namespace.
 
 Run artifacts land in `~/.cache/codex-subagent/<timestamp>-<pid>/` as
 `prompt.txt`, `command.json`, `meta.json`, `events.jsonl`, `stderr.txt`,
-`answer.md`, `pid`, `exit`, plus `resume-id` when resuming. Nothing is cleaned
-up automatically; `codex-subagent purge` removes them all.
+`answer.md`, `pid`, `exit`, plus `git-before.json` when the working root is a
+repository and `resume-id` when resuming. Nothing is cleaned up automatically;
+`codex-subagent purge` removes them all.
+
+`--run-dir` puts them somewhere else, which is worth knowing if reading from
+`~/.cache` is awkward from where the agent runs.
 
 ## How it works
 
