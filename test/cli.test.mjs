@@ -444,6 +444,21 @@ test("end to end with a stub codex", async (t) => {
     assert.match(cli(["wait", runDir, "--timeout-sec", "20"], { env }).out, /changed:\s+nothing/);
   });
 
+  // The receipt the agent returns always carries a `changed:` line, so a working
+  // root outside any git repository must still produce one.
+  await t.test("a non-git working root still reports a changed line", () => {
+    const plain = fs.mkdtempSync(path.join(TMP, "nogit-"));
+    assert.notEqual(spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: plain }).status, 0,
+                    "the temp working root is itself inside a git repo");
+    const bin = stubCodex(STUB_OK);
+    const env = { PATH: bin + path.delimiter + process.env.PATH };
+    const started = cli(["start", "--workdir", plain, "--sandbox", "read-only"], { stdin: "look only", env });
+    const runDir = started.out.trim().split("\n").pop();
+    const r = cli(["wait", runDir, "--timeout-sec", "20"], { env });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /changed:\s+unknown/, "no changed line for a non-git working root");
+  });
+
   // A run killed halfway may still have edited files, which is exactly when the
   // caller most needs to know which ones.
   await t.test("a run that died still reports what it changed", { skip: !hasGit() }, () => {

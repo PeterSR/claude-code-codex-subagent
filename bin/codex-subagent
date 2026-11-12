@@ -178,7 +178,11 @@ const MAX_LISTED = 40;
 function blastRadius(runDir) {
   let before = null;
   try { before = JSON.parse(read(path.join(runDir, "git-before.json")) || "null"); } catch { /* ignore */ }
-  if (!before?.root) return [];
+  // No snapshot exists: the working root sat outside a git repository, or the run
+  // resumed a thread pinned elsewhere. The agent's receipt always carries a
+  // `changed:` line, so name the gap here; printing nothing leaves the wrapper
+  // filling that field from guesswork.
+  if (!before?.root) return ["changed:   unknown, this run took no git snapshot"];
 
   const after = gitSnapshot(before.root);
   if (!after) return [`changed:   unknown, ${before.root} could not be re-read with git`];
